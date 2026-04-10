@@ -1,8 +1,38 @@
-from rapidocr_onnxruntime import RapidOCR
+import os
 from pathlib import Path
+
+# V15.1: 虚拟环境驱动自愈逻辑
+# 自动扫描 .venv/Lib/site-packages/nvidia/ 下的所有 bin 目录，解决 cuDNN/cuBLAS 找不到的问题
+def _bridge_venv_dlls():
+    try:
+        # 指轴到项目根目录 (假设 ocr_helper 在 src/utils/ 下)
+        base_path = Path(__file__).parent.parent.parent
+        venv_nvidia_path = base_path / ".venv" / "Lib" / "site-packages" / "nvidia"
+        
+        if venv_nvidia_path.exists():
+            print(f"[OCR] 正在扫描虚拟环境驱动库: {venv_nvidia_path}")
+            # 查找所有包含 bin 的子目录 (uv 安装的 nvidia 包通常在这个结构下)
+            bin_dirs = list(venv_nvidia_path.glob("**/bin"))
+            for bin_dir in bin_dirs:
+                if bin_dir.is_dir():
+                    abspath = str(bin_dir.absolute())
+                    os.add_dll_directory(abspath)
+                    print(f"[OCR] 已成功桥接自愈链路: {bin_dir.parent.name}/{bin_dir.name}")
+        
+        # 兼容性备份：传统的系统级 CUDA 12 路径
+        cuda_bin = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin"
+        if os.path.exists(cuda_bin):
+            os.add_dll_directory(cuda_bin)
+            print(f"[OCR] 已成功桥接系统级 CUDA 12.9 物理链路")
+            
+    except Exception as e:
+        print(f"[OCR] 驱动链路自愈失败 (无权限或路径异常): {e}")
+
+_bridge_venv_dlls()
+
+from rapidocr_onnxruntime import RapidOCR
 import numpy as np
 from PIL import Image
-
 import onnxruntime as ort
 
 class OCRHelper:
