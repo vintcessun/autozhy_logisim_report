@@ -1,6 +1,9 @@
+import asyncio
+import pyautogui
 import google.generativeai as genai
 from ..utils.sim_runner import LogisimEmulator
 from ..utils.tars_bridge import TarsBridge
+from ..utils.gui_utils import ScreenControl, ScreenLockContext, screen_lock
 
 class VerificationAgent:
     """
