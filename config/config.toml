@@ -1,0 +1,22 @@
+# Gemini API 配置文件
+
+[gemini]
+# API 密钥
+api_key = "YOUR_API_KEY_HERE"
+
+# API 基准地址 (可选，用于中转或特定区域)
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+# 模型选型
+model_pro = "gemini-1.5-pro"
+model_flash = "gemini-1.5-flash"
+
+[paths]
+# 外部二进制工具路径
+logisim_path = "3rd/Logisim-ITA.exe"
+bin_7z_path = "3rd/7z.exe"
+
+[ollama]
+# 本地推理后端
+endpoint = "http://localhost:11434"
+model_name = "gemma4:e2b"
