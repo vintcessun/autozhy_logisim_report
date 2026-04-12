@@ -5,18 +5,8 @@
 api_key = "YOUR_API_KEY_HERE"
 
 # API 基准地址 (可选，用于中转或特定区域)
-base_url = "https://generativelanguage.googleapis.com/"
+base_url = "YOUR_BASE_URL_HERE"
 
 # 模型选型
-model_pro = "gemini-3.1-pro-preview"
-model_flash = "gemini-3-flash-preview"
-
-[paths]
-# 外部二进制工具路径
-logisim_path = "3rd/Logisim-ITA.exe"
-bin_7z_path = "3rd/7z.exe"
-
-[ollama]
-# 本地推理后端
-endpoint = "http://localhost:11434"
-model_name = "gemma4:e2b"
+model_pro = "gemini-3-flash" # 测试使用的是flash作为决策模型
+model_flash = "gemini-3.1-flash-lite" # 使用flash-lite作为进行具体实践的模型
