@@ -73,25 +73,10 @@ def _instance_id(component: RawComponent, index: int) -> str:
     return f"{component.name}_{index}_{x}_{y}"
 
 
-def _find_circuit(project: RawProject, name: str) -> RawCircuit | None:
-    if project.has_circuit(name):
-        return project.circuit(name)
-    
-    # Fuzzy match helper: strip trailing Chinese/English parenthesis and whitespace
-    def normalize(n: str) -> str:
-        return n.split('（')[0].split('(')[0].strip()
-
-    base_name = normalize(name)
-    for circuit in project.circuits:
-        if normalize(circuit.name) == base_name:
-            return circuit
-    return None
-
-
 def _subcircuit_ports(component: RawComponent, project: RawProject) -> list[tuple[str, tuple[int, int], dict[str, Any]]]:
-    target = _find_circuit(project, component.name)
-    if not target:
+    if component.lib is not None or not project.has_circuit(component.name):
         return []
+    target = project.circuit(component.name)
     facing = component.get("facing", "east") or "east"
     result: list[tuple[str, tuple[int, int], dict[str, Any]]] = []
     for port in target.port_offsets(facing=facing):
@@ -105,7 +90,7 @@ def _subcircuit_ports(component: RawComponent, project: RawProject) -> list[tupl
                     "width": port.width,
                     "label": port.label,
                     "pin_loc": port.pin_loc,
-                    "target_circuit": target.name,
+                    "target_circuit": component.name,
                 },
             )
         )
@@ -136,7 +121,7 @@ def _component_ports(component: RawComponent, project: RawProject | None = None)
 
 def extract_logical_circuit(
     circuit: RawCircuit,
-    radius: int = 12,
+    radius: int = 60,
     project: RawProject | None = None,
 ) -> LogicalCircuit:
     split_points = {
@@ -160,10 +145,6 @@ def extract_logical_circuit(
         resolved_ports = _component_ports(component, project)
         if resolved_ports:
             port_entries = resolved_ports
-            # Update kind to the resolved circuit name for subcircuits
-            target = _find_circuit(project, component.name)
-            if target:
-                instance.kind = target.name
         else:
             attach_points = infer_component_attachment_points(component, graph, radius=radius)
             port_entries = [(("io" if len(attach_points) == 1 else f"p{port_index}"), point, {}) for port_index, point in enumerate(attach_points)]
@@ -177,8 +158,7 @@ def extract_logical_circuit(
                 continue
             nets.setdefault(net_id, LogicalNet(id=net_id)).endpoints.append(LogicalEndpoint(instance=instance.id, port=port_name))
             if component.name == "Tunnel":
-                # Normalize label for robust matching
-                label = (component.get("label", "") or "").split('（')[0].split('(')[0].strip()
+                label = component.get("label", "") or ""
                 if label:
                     nets[net_id].tunnel_labels.add(label)
                     tunnel_groups[label].append(net_id)

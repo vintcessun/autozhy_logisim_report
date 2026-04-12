@@ -1016,8 +1016,6 @@ class LogicCircuitBuilder:
         raw_components: dict[str, RawComponent],
         geometries: dict[str, ComponentGeometry],
     ) -> tuple[list[RawWire], list[RawComponent]]:
-        if not self.nets:
-            return [], []
         component_bounds = [
             geometry.absolute_bounds(raw_components[instance_id].loc)
             for instance_id, geometry in geometries.items()
@@ -1051,10 +1049,10 @@ class LogicCircuitBuilder:
             for instance_id, geometry in geometries.items()
             for port in geometry.ports
         }
-        port_escapes = {} # Short circuit topological matrix routing loops for extreme net density
+        port_escapes = self._port_escape_candidates(raw_components, geometries, all_port_points)
         endpoint_sides = {
             endpoint_key: self._port_side(geometries[endpoint_key[0]], endpoint_key[1])
-            for endpoint_key in all_port_points
+            for endpoint_key in port_escapes
         }
         blocked = self._component_blockers(raw_components, geometries)
         tunneled_side_groups: set[tuple[str, str]] = set()
@@ -2886,12 +2884,6 @@ class LogicCircuitBuilder:
         occupied_tunnel_points: set[Point],
         forbidden_points: set[Point] | None = None,
     ) -> list[Point]:
-        # Fast-track Tunnel label geometry placement in ultra-dense logical configurations
-        offset = (-self.grid if side == "left" else self.grid if side == "right" else 0,
-                  -self.grid if side == "top" else self.grid if side == "bottom" else 0)
-        target = (point[0] + offset[0], point[1] + offset[1])
-        return [point, target]
-        
         base_distance = max(self.grid * 5, _ceil_grid(max(self.grid * 3, self.placement_clearance + self.grid * 2), self.grid))
         distances = [base_distance + self.grid * 2 * index for index in range(20)]
         tangent_offsets = self._ordered_spread_offsets(0, step=self.grid * 2, limit=self.grid * 24)
@@ -2975,12 +2967,7 @@ class LogicCircuitBuilder:
         if ranked:
             ranked.sort(key=lambda item: item[0])
             return list(ranked[0][1])
-            
-        # Fallback to direct overlap if visually blocked
-        offset = (-self.grid if side == "left" else self.grid if side == "right" else 0,
-                  -self.grid if side == "top" else self.grid if side == "bottom" else 0)
-        target = (point[0] + offset[0], point[1] + offset[1])
-        return [point, target]
+        raise RuntimeError(f"failed to place tunnel lead from {point!r} on side {side}")
 
     def _plan_net_route(
         self,
@@ -3450,7 +3437,6 @@ class LogicCircuitBuilder:
         return "north"
 
     def _port_side(self, geometry: ComponentGeometry, port_name: str) -> str:
-        print(f"DEBUG Port Look-up: {port_name} in {[p.name for p in geometry.ports]}")
         port = next(port for port in geometry.ports if port.name == port_name)
         return _nearest_side_name(geometry.bounds, port.offset)
 
@@ -3467,15 +3453,13 @@ class LogicCircuitBuilder:
             if len(geometry.ports) == 1:
                 port = geometry.ports[0]
                 point = all_port_points[(instance_id, port.name)]
-                res = self._single_port_escape_candidates(
+                result[(instance_id, port.name)] = self._single_port_escape_candidates(
                     component,
                     geometry,
                     port.name,
                     point,
                     side_demand=side_demands.get((instance_id, self._port_side(geometry, port.name)), 1),
                 )
-                print(f"DEBUG Escape for {instance_id}.{port.name}: {len(res)} candidates")
-                result[(instance_id, port.name)] = res
                 continue
             left = geometry.bounds[0]
             right = geometry.bounds[0] + geometry.bounds[2]

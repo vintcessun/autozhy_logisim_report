@@ -12,7 +12,7 @@ class LogisimEmulator:
         self.config = config
         self.client = client
         # HTTP/WS 端口在 config 里，如果没有则默认 9924
-        self.port = getattr(self.config.paths, "headless_port", 9924)
+        self.port = self.config.headless.port
         self.uri = f"ws://localhost:{self.port}/ws"
         self.ws = None
 

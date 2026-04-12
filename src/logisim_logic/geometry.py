@@ -209,6 +209,85 @@ def _combine_bounds(first: Bounds, second: Bounds) -> Bounds:
     return (min_x, min_y, max_x - min_x, max_y - min_y)
 
 
+_TUNNEL_MARGIN = 3
+_TUNNEL_LABEL_MARGIN = 5
+_TUNNEL_ARROW_DEPTH = 4
+_TUNNEL_ARROW_MAX_WIDTH = 20
+
+
+def _bounds_from_points(points: tuple[Point, ...]) -> Bounds:
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    min_x = min(xs)
+    min_y = min(ys)
+    max_x = max(xs)
+    max_y = max(ys)
+    return (min_x, min_y, max(1, max_x - min_x), max(1, max_y - min_y))
+
+
+def _tunnel_label_layout(facing: Direction) -> tuple[int, int, int, int]:
+    if facing == NORTH:
+        return (0, _TUNNEL_LABEL_MARGIN, 0, -1)
+    if facing == SOUTH:
+        return (0, -_TUNNEL_LABEL_MARGIN, 0, 2)
+    if facing == EAST:
+        return (-_TUNNEL_LABEL_MARGIN, 0, 1, 3)
+    return (_TUNNEL_LABEL_MARGIN, 0, -1, 3)
+
+
+def _tunnel_box_metrics(component: RawComponent) -> tuple[int, int, int, int]:
+    label = component.get("label", "") or ""
+    font_size = _font_size(component)
+    font_family = _font_family(component)
+    text_width, ascent, descent = _measure_text(label, font_family, font_size)
+    text_height = ascent + descent
+    body_width = max(10, text_width)
+    body_height = max(10, text_height)
+    label_x, label_y, halign, valign = _tunnel_label_layout(_facing(component, "east"))
+    if halign == -1:
+        box_x = label_x
+    elif halign == 1:
+        box_x = label_x - body_width
+    else:
+        box_x = label_x - body_width // 2
+    if valign == -1:
+        box_y = label_y
+    elif valign == 2:
+        box_y = label_y - body_height
+    else:
+        box_y = label_y - body_height // 2
+    return (box_x, box_y, body_width, body_height)
+
+
+def _tunnel_outline_points(component: RawComponent) -> tuple[Point, ...]:
+    facing = _facing(component, "east")
+    box_x, box_y, body_width, body_height = _tunnel_box_metrics(component)
+    x0 = box_x - _TUNNEL_MARGIN
+    y0 = box_y - _TUNNEL_MARGIN
+    x1 = x0 + body_width + 2 * _TUNNEL_MARGIN
+    y1 = y0 + body_height + 2 * _TUNNEL_MARGIN
+    mw = _TUNNEL_ARROW_MAX_WIDTH // 2
+    if facing == NORTH:
+        yb = y0 + _TUNNEL_ARROW_DEPTH
+        if x1 - x0 <= 20:
+            return ((x0, yb), (0, y0), (x1, yb), (x1, y1), (x0, y1))
+        return ((x0, yb), (-mw, yb), (0, y0), (mw, yb), (x1, yb), (x1, y1), (x0, y1))
+    if facing == SOUTH:
+        yb = y1 - _TUNNEL_ARROW_DEPTH
+        if x1 - x0 <= 20:
+            return ((x0, y0), (x1, y0), (x1, yb), (0, y1), (x0, yb))
+        return ((x0, y0), (x1, y0), (x1, yb), (mw, yb), (0, y1), (-mw, yb), (x0, yb))
+    if facing == EAST:
+        xb = x1 - _TUNNEL_ARROW_DEPTH
+        if y1 - y0 <= 20:
+            return ((x0, y0), (xb, y0), (x1, 0), (xb, y1), (x0, y1))
+        return ((x0, y0), (xb, y0), (xb, -mw), (x1, 0), (xb, mw), (xb, y1), (x0, y1))
+    xb = x0 + _TUNNEL_ARROW_DEPTH
+    if y1 - y0 <= 20:
+        return ((xb, y0), (x1, y0), (x1, y1), (xb, y1), (x0, 0))
+    return ((xb, y0), (x1, y0), (x1, y1), (xb, y1), (xb, mw), (x0, 0), (xb, -mw))
+
+
 def _label_loc(component: RawComponent, default: str = "center") -> str:
     raw = (component.get("labelloc", default) or default).strip().lower()
     return raw if raw else default
@@ -298,8 +377,8 @@ def _probe_like_bounds(facing: Direction, width_value: int) -> Bounds:
     if facing == WEST:
         return (0, -10 if logical_len <= 8 else -vertical_ht // 2, east_wid, vertical_ht)
     if facing == NORTH:
-        return (-east_wid // 2, -20 if logical_len <= 8 else -vertical_ht, east_wid, vertical_ht)
-    return (-east_wid // 2, 0, east_wid, vertical_ht)
+        return (-east_wid // 2, 0, east_wid, vertical_ht)
+    return (-east_wid // 2, -20 if logical_len <= 8 else -vertical_ht, east_wid, vertical_ht)
 
 
 def _pin_geometry(component: RawComponent) -> ComponentGeometry:
@@ -311,8 +390,10 @@ def _pin_geometry(component: RawComponent) -> ComponentGeometry:
 
 def _probe_geometry(component: RawComponent) -> ComponentGeometry:
     facing = _facing(component, "east")
-    width_value = int(component.get("width", "1") or "1")
-    return _single_port(_probe_like_bounds(facing, width_value), "input", width=str(width_value))
+    width_attr = component.get("width")
+    width_value = int(width_attr or "1")
+    # Probe width is runtime-derived in Logisim and is not persisted in .circ.
+    return _single_port(_probe_like_bounds(facing, width_value), "input", width=width_attr)
 
 
 def _clock_geometry(component: RawComponent) -> ComponentGeometry:
@@ -344,37 +425,14 @@ def _random_geometry(component: RawComponent) -> ComponentGeometry:
 
 
 def _tunnel_geometry(component: RawComponent) -> ComponentGeometry:
-    facing = _facing(component, "east")
-    label = component.get("label", "") or ""
-    font_size = _font_size(component)
-    font_family = _font_family(component)
-    text_width, ascent, descent = _measure_text(label, font_family, font_size)
-    text_height = ascent + descent
-    margin = 3
-    min_dim = 16 - 2 * margin
-    body_width = max(min_dim, text_width)
-    body_height = max(min_dim, text_height)
-    if facing == NORTH:
-        label_x, label_y, halign, valign = 0, 5, 0, -1
-    elif facing == SOUTH:
-        label_x, label_y, halign, valign = 0, -5, 0, 2
-    elif facing == EAST:
-        label_x, label_y, halign, valign = -5, 0, 1, 3
-    else:
-        label_x, label_y, halign, valign = 5, 0, -1, 3
-    if halign == -1:
-        bx = label_x
-    elif halign == 1:
-        bx = label_x - body_width
-    else:
-        bx = label_x - body_width // 2
-    if valign == -1:
-        by = label_y
-    elif valign == 2:
-        by = label_y - body_height
-    else:
-        by = label_y - body_height // 2
-    bounds = (bx - margin, by - margin, body_width + 2 * margin, body_height + 2 * margin)
+    box_x, box_y, body_width, body_height = _tunnel_box_metrics(component)
+    bounds = (
+        box_x - _TUNNEL_MARGIN,
+        box_y - _TUNNEL_MARGIN,
+        body_width + 2 * _TUNNEL_MARGIN,
+        body_height + 2 * _TUNNEL_MARGIN,
+    )
+    bounds = _combine_bounds(bounds, _bounds_from_points(_tunnel_outline_points(component)))
     bounds = _combine_bounds(bounds, (0, 0, 1, 1))
     return _single_port(bounds, "inout", width=component.get("width"))
 
@@ -572,6 +630,113 @@ def _rom_geometry(component: RawComponent) -> ComponentGeometry:
     )
 
 
+def _register_geometry(component: RawComponent) -> ComponentGeometry:
+    width = component.get("width", "8")
+    return ComponentGeometry(
+        bounds=(-30, -20, 30, 40),
+        ports=(
+            PortGeometry("Q", (0, 0), "output", width),
+            PortGeometry("D", (-30, 0), "input", width),
+            PortGeometry("CK", (-20, 20), "input", "1"),
+            PortGeometry("CLR", (-10, 20), "input", "1"),
+            PortGeometry("EN", (-30, 10), "input", "1"),
+        ),
+    )
+
+
+def _counter_geometry(component: RawComponent) -> ComponentGeometry:
+    width = component.get("width", "8")
+    return ComponentGeometry(
+        bounds=(-30, -20, 30, 40),
+        ports=(
+            PortGeometry("Q", (0, 0), "output", width),
+            PortGeometry("D", (-30, 0), "input", width),
+            PortGeometry("CK", (-20, 20), "input", "1"),
+            PortGeometry("CLR", (-10, 20), "input", "1"),
+            PortGeometry("LD", (-30, -10), "input", "1"),
+            PortGeometry("CT", (-30, 10), "input", "1"),
+            PortGeometry("CARRY", (0, 10), "output", "1"),
+        ),
+    )
+
+
+def _ram_geometry(component: RawComponent) -> ComponentGeometry:
+    data_width = component.get("dataWidth", "8")
+    addr_width = component.get("addrWidth", "8")
+    bus = component.get("bus", "combined") or "combined"
+    ports = [
+        PortGeometry("DATA", (0, 0), "inout", data_width),
+        PortGeometry("ADDR", (-140, 0), "input", addr_width),
+        PortGeometry("CS", (-90, 40), "input", "1"),
+        PortGeometry("OE", (-50, 40), "input", "1"),
+        PortGeometry("CLR", (-30, 40), "input", "1"),
+    ]
+    if bus != "asynch":
+        ports.append(PortGeometry("CLK", (-70, 40), "input", "1"))
+    if bus == "separate":
+        ports.append(PortGeometry("WE", (-110, 40), "input", "1"))
+        ports.append(PortGeometry("DIN", (-140, 20), "input", data_width))
+    return ComponentGeometry(bounds=(-140, -40, 140, 80), ports=tuple(ports))
+
+
+def _controlled_buffer_geometry(component: RawComponent) -> ComponentGeometry:
+    facing = _facing(component, "east")
+    width = component.get("width", "1")
+    control = component.get("control", "right") or "right"
+    bounds = {
+        NORTH: (-10, 0, 20, 20),
+        SOUTH: (-10, -20, 20, 20),
+        WEST: (0, -10, 20, 20),
+        EAST: (-20, -10, 20, 20),
+    }[facing]
+    input_offset = _translate_point((0, 0), facing.reverse(), 20)
+    control_offset = _translate_point((0, 0), facing.reverse(), 10, right=10 if control == "left" else -10)
+    return ComponentGeometry(
+        bounds=bounds,
+        ports=(
+            PortGeometry("out", (0, 0), "output", width),
+            PortGeometry("in", input_offset, "input", width),
+            PortGeometry("control", control_offset, "input", "1"),
+        ),
+    )
+
+
+def _priority_encoder_geometry(component: RawComponent) -> ComponentGeometry:
+    facing = _facing(component, "east")
+    select_width = _int_attr(component, "select", 3)
+    inputs = 1 << select_width
+
+    if facing == NORTH:
+        bounds = (-5 * inputs, 0, 10 * inputs + 10, 40)
+    elif facing == SOUTH:
+        bounds = (-5 * inputs, -40, 10 * inputs + 10, 40)
+    elif facing == WEST:
+        bounds = (0, -5 * inputs, 40, 10 * inputs + 10)
+    else:
+        bounds = (-40, -5 * inputs, 40, 10 * inputs + 10)
+
+    ports: list[PortGeometry] = []
+    if facing in {NORTH, SOUTH}:
+        x = -5 * inputs + 10
+        y = 40 if facing == NORTH else -40
+        for index in range(inputs):
+            ports.append(PortGeometry(f"in{index}", (x + 10 * index, y), "input", "1"))
+        ports.append(PortGeometry("out", (0, 0), "output", str(select_width)))
+        ports.append(PortGeometry("enable_in", (x + 10 * inputs, y // 2), "input", "1"))
+        ports.append(PortGeometry("enable_out", (x - 10, y // 2), "output", "1"))
+        ports.append(PortGeometry("GS", (10, 0), "output", "1"))
+    else:
+        x = -40 if facing == EAST else 40
+        y = -5 * inputs + 10
+        for index in range(inputs):
+            ports.append(PortGeometry(f"in{index}", (x, y + 10 * index), "input", "1"))
+        ports.append(PortGeometry("out", (0, 0), "output", str(select_width)))
+        ports.append(PortGeometry("enable_in", (x // 2, y + 10 * inputs), "input", "1"))
+        ports.append(PortGeometry("enable_out", (x // 2, y - 10), "output", "1"))
+        ports.append(PortGeometry("GS", (0, 10), "output", "1"))
+    return ComponentGeometry(bounds=bounds, ports=tuple(ports))
+
+
 def _dot_matrix_geometry(component: RawComponent) -> ComponentGeometry:
     cols = int(component.get("matrixcols", "5") or "5")
     rows = int(component.get("matrixrows", "7") or "7")
@@ -641,55 +806,7 @@ _ABSTRACT_GATE_KINDS = {
     "NOR Gate",
     "XNOR Gate",
     "Odd Parity",
-    "Odd Parity Gate",
 }
-
-
-def _register_geometry(component: RawComponent) -> ComponentGeometry:
-    width = component.get("width", "8")
-    # Logisim Register: Data West, Clock South, Out East, EN South, CLR South
-    return ComponentGeometry(
-        bounds=(-30, -20, 30, 40),
-        ports=(
-            PortGeometry("in", (-30, 0), "input", width),
-            PortGeometry("out", (0, 0), "output", width),
-            PortGeometry("cp", (-20, 20), "input", "1"),
-            PortGeometry("en", (-10, 20), "input", "1"),
-            PortGeometry("clr", (0, 20), "input", "1"),
-        ),
-    )
-
-
-def _counter_geometry(component: RawComponent) -> ComponentGeometry:
-    width = component.get("width", "8")
-    # Logisim Counter: Clock West(ish), Load West, Out East, EN South, CLR South
-    return ComponentGeometry(
-        bounds=(-40, -20, 40, 40),
-        ports=(
-            PortGeometry("out", (0, 0), "output", width),
-            PortGeometry("in", (-40, 0), "input", width),
-            PortGeometry("cp", (-40, 10), "input", "1"),
-            PortGeometry("load", (-40, -10), "input", "1"),
-            PortGeometry("en", (-20, 20), "input", "1"),
-            PortGeometry("clr", (-10, 20), "input", "1"),
-            PortGeometry("up", (-30, 20), "input", "1"),
-        ),
-    )
-
-
-def _d_flip_flop_geometry(component: RawComponent) -> ComponentGeometry:
-    # Logisim D Flip-Flop: D West, Clock West, Q East, ~Q East, PRE North, CLR South
-    return ComponentGeometry(
-        bounds=(-40, -20, 40, 40),
-        ports=(
-            PortGeometry("D", (-40, -10), "input", "1"),
-            PortGeometry("cp", (-40, 10), "input", "1"),
-            PortGeometry("Q", (0, -10), "output", "1"),
-            PortGeometry("~Q", (0, 10), "output", "1"),
-            PortGeometry("pre", (-20, -20), "input", "1"),
-            PortGeometry("clr", (-20, 20), "input", "1"),
-        ),
-    )
 
 
 def _abstract_gate_geometry(component: RawComponent) -> ComponentGeometry:
@@ -786,7 +903,6 @@ def _splitter_parameters(facing: Direction, fanout: int, appear: str) -> tuple[i
 
 
 def _splitter_geometry(component: RawComponent) -> ComponentGeometry:
-    print(f"DEBUG Splitter: {component.attrs}")
     facing = _facing(component, "east")
     incoming = _int_attr(component, "incoming", 2)
     fanout = _int_attr(component, "fanout", 2)
@@ -880,26 +996,30 @@ def get_component_geometry(component: RawComponent, project: RawProject | None =
         return _decoder_geometry(component)
     if component.name == "Splitter":
         return _splitter_geometry(component)
-    if component.name == "Register":
-        return _register_geometry(component)
-    if component.name == "Counter":
-        return _counter_geometry(component)
-    if component.name == "D Flip-Flop":
-        return _d_flip_flop_geometry(component)
     if component.name == "Bit Extender":
         return _bit_extender_geometry(component)
     if component.name == "ROM":
         return _rom_geometry(component)
+    if component.name == "Register":
+        return _register_geometry(component)
+    if component.name == "Counter":
+        return _counter_geometry(component)
+    if component.name == "RAM":
+        return _ram_geometry(component)
     if component.name == "DotMatrix":
         return _dot_matrix_geometry(component)
     if component.name == "Buffer":
         return _buffer_geometry(component)
+    if component.name == "Controlled Buffer":
+        return _controlled_buffer_geometry(component)
+    if component.name == "Priority Encoder":
+        return _priority_encoder_geometry(component)
     if component.name == "NOT Gate":
         return _not_gate_geometry(component)
     if component.name in _ABSTRACT_GATE_KINDS:
         return _abstract_gate_geometry(component)
     if component.name in {"Power", "Ground", "Pull Resistor"}:
-        return _single_port((-20, -20, 20, 20), "output" if component.name in {"Power", "Ground"} else "input", width=component.get("width", "1"))
+        return _single_port((-20, -20, 20, 20), "output" if component.name == "Power" else "input", width=component.get("width", "1"))
     return _single_port((-20, -20, 40, 40), "inout", width=component.get("width"))
 
 
@@ -933,13 +1053,18 @@ _FALLBACK_LIBS = {
     "Odd Parity": "1",
     "NOT Gate": "1",
     "Buffer": "1",
+    "Controlled Buffer": "1",
     "Comparator": "2",
     "Multiplexer": "2",
     "Decoder": "2",
+    "Priority Encoder": "2",
     "Adder": "3",
     "Subtractor": "3",
     "Multiplier": "3",
     "Random": "4",
+    "Register": "4",
+    "Counter": "4",
+    "RAM": "4",
     "ROM": "4",
     "Button": "5",
     "LED": "5",

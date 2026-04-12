@@ -31,6 +31,7 @@ save_project(project, Path("copy.circ"))
 - 想从逻辑关系重建一个编码器/解码器：优先用 `LogicCircuitBuilder`
 - 想在原图某个端口旁边自动挂一个新模块：优先用 `rebuild_support.py` 里的 `attach_*`
 - 想看导线连通关系或逻辑网络：用 `build_wire_graph()` / `extract_logical_circuit()`
+- 想定位 Logisim 里会变成橙红色的位宽错误导线：用 `find_width_conflicts()` / `find_invalid_wire_indexes()`
 
 ## 示例 1：读取电路里有哪些元器件
 
@@ -154,6 +155,38 @@ for net in list(graph.nets.values())[:3]:
 - 检查某根线有没有断
 - 检查某个点是不是交叉但未连接
 - 调试布局/布线器
+
+## 示例 4.5：定位橙红导线位宽错误
+
+如果 Logisim 里某些导线变成橙红色，通常说明同一个 wire bundle 上落入了互不兼容的位宽。
+
+`find_width_conflicts()` 会返回冲突详情，`find_invalid_wire_indexes()` 会直接告诉你哪些导线段属于失效 bundle。
+
+```python
+from pathlib import Path
+from logisim_logic import load_project, find_width_conflicts, find_invalid_wire_indexes
+
+project = load_project(Path("6位原码阵列乘法器.circ"))
+circuit = project.circuit("6位原码阵列乘法器")
+
+conflicts = find_width_conflicts(circuit, project=project)
+print("冲突数：", len(conflicts))
+
+for conflict in conflicts:
+    print(conflict.kind, conflict.net_id, conflict.widths())
+    print("  导线索引 =", conflict.wire_indexes)
+    print("  冲突点 =", sorted(conflict.points))
+    for determinant in conflict.determinants:
+        print("   ", determinant.instance, determinant.port, determinant.point, determinant.width)
+
+print("橙红导线索引：", find_invalid_wire_indexes(circuit, project=project))
+```
+
+这更适合：
+
+- 检查 splitter 某一支路是否错误接到了总线
+- 检查 tunnel 同名但宽度不一致的问题
+- 在自动修改电路后做结构性回归，而不是只靠 Logisim 肉眼检查
 
 ## 示例 5：在原图基础上改属性
 

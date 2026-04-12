@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from collections import Counter, defaultdict
+from collections.abc import Callable
+from copy import deepcopy
 from itertools import count
 
 from .geometry import get_component_geometry
@@ -12,12 +13,21 @@ from .layout import (
     component_extents,
     default_splitter_pitch as module_default_splitter_pitch,
     place_attached_component,
+    route_circuit_path,
 )
 from .model import RawAttribute, RawCircuit, RawComponent, RawProject, RawWire
 
 _LABEL_COUNTER = count()
 _ATTACHMENTS: defaultdict[int, list[dict[str, object]]] = defaultdict(list)
 _BUS_TUNNELS: defaultdict[int, list[dict[str, object]]] = defaultdict(list)
+_TUNNEL_SLOT_STATE: defaultdict[tuple[object, ...], set[int]] = defaultdict(set)
+
+_OPPOSITE_FACING = {
+    "east": "west",
+    "west": "east",
+    "north": "south",
+    "south": "north",
+}
 
 SUBCIRCUIT_INSTANCE_ATTRS = {
     "facing": "east",
@@ -84,6 +94,120 @@ def detunnelize_circuit(
         if not changed:
             break
     _detunnelize_remaining_groups(circuit, preserved=preserved, project=project)
+
+
+def detunnelize_selected_tunnels(
+    circuit: RawCircuit,
+    *,
+    remove_labels: set[str] | None = None,
+    keep_labels: set[str] | None = None,
+    remove_predicate: Callable[[RawComponent], bool] | None = None,
+    keep_predicate: Callable[[RawComponent], bool] | None = None,
+    project: RawProject | None = None,
+    passes: int = 2,
+    check_widths: bool = True,
+) -> dict[str, list[str]]:
+    """Replace explicitly selected Tunnel components with real wires.
+
+    Existing semantic tunnels should usually be kept.  If a kept tunnel shares
+    a label with selected tunnels, the label group is wired first and the kept
+    tunnel is restored at its original location as a visual/net-name marker.
+    """
+
+    labels_to_remove = set(remove_labels or set())
+    labels_to_keep = set(keep_labels or set())
+    if not labels_to_remove and remove_predicate is None:
+        raise ValueError("detunnelize_selected_tunnels requires remove_labels or remove_predicate")
+
+    report: dict[str, list[str]] = {
+        "removed": [],
+        "kept": [],
+        "skipped": [],
+    }
+
+    def label_of(component: RawComponent) -> str:
+        return component.get("label", "") or ""
+
+    def should_keep(component: RawComponent) -> bool:
+        label = label_of(component)
+        return label in labels_to_keep or (keep_predicate is not None and keep_predicate(component))
+
+    def should_remove(component: RawComponent) -> bool:
+        if should_keep(component):
+            return False
+        label = label_of(component)
+        return label in labels_to_remove or (remove_predicate is not None and remove_predicate(component))
+
+    def tunnel_components(subject: RawCircuit) -> list[RawComponent]:
+        return [component for component in subject.components if component.name == "Tunnel"]
+
+    grouped: defaultdict[str, list[RawComponent]] = defaultdict(list)
+    for tunnel in tunnel_components(circuit):
+        grouped[label_of(tunnel)].append(tunnel)
+
+    for label in sorted(grouped):
+        components = grouped[label]
+        selected = [component for component in components if should_remove(component)]
+        if not selected:
+            report["kept"].append(label)
+            continue
+        if len(components) < 2:
+            report["skipped"].append(f"{label}: singleton")
+            continue
+        widths = {_tunnel_width(component) for component in components}
+        if len(widths) != 1:
+            report["skipped"].append(f"{label}: mixed widths {sorted(widths)}")
+            continue
+
+        selected_locations = {tuple(component.loc) for component in selected}
+        restored = [deepcopy(component) for component in components if not should_remove(component)]
+        restored_locations = {tuple(component.loc) for component in restored}
+        all_labels = {label_of(component) for component in tunnel_components(circuit)}
+        trial = deepcopy(circuit)
+        try:
+            detunnelize_circuit(
+                trial,
+                keep_labels=all_labels - {label},
+                project=project,
+                passes=passes,
+            )
+        except Exception as exc:
+            report["skipped"].append(f"{label}: {exc}")
+            continue
+
+        remaining_selected = [
+            component
+            for component in tunnel_components(trial)
+            if label_of(component) == label and tuple(component.loc) in selected_locations
+        ]
+        if remaining_selected:
+            report["skipped"].append(f"{label}: unchanged")
+            continue
+
+        trial.components = [
+            component
+            for component in trial.components
+            if not (
+                component.name == "Tunnel"
+                and label_of(component) == label
+                and tuple(component.loc) in restored_locations
+            )
+        ]
+        trial.components.extend(restored)
+
+        if check_widths:
+            from .diagnostics import find_width_conflicts
+
+            conflicts = find_width_conflicts(trial, project=project)
+            if conflicts:
+                report["skipped"].append(f"{label}: width conflicts {len(conflicts)}")
+                continue
+
+        circuit.components = trial.components
+        circuit.wires = trial.wires
+        report["removed"].append(label)
+
+    return report
 
 
 def _wire_adjacency(circuit: RawCircuit) -> dict[tuple[int, int], set[tuple[int, int]]]:
@@ -615,6 +739,343 @@ def _lead_facing(port_point: tuple[int, int], lead_point: tuple[int, int]) -> st
     return "north"
 
 
+def _tunnel_attrs(label: str, width: int, *, facing: str) -> dict[str, str]:
+    return {
+        "facing": facing,
+        "width": str(width),
+        "label": label,
+        "labelfont": "Dialog plain 12",
+    }
+
+
+def _preferred_tunnel_distance(
+    component: RawComponent,
+    port_name: str,
+    *,
+    project: RawProject | None = None,
+) -> int:
+    port_point, lead_point = component_port_lead(component, port_name, project=project)
+    return max(30, abs(port_point[0] - lead_point[0]) + abs(port_point[1] - lead_point[1]))
+
+
+def _tunnel_snap10(value: int) -> int:
+    return ((value + 9) // 10) * 10
+
+
+def _find_port_at_point(
+    circuit: RawCircuit,
+    loc: tuple[int, int],
+    *,
+    project: RawProject | None = None,
+) -> tuple[RawComponent, str] | None:
+    for component in reversed(circuit.components):
+        if component.name in {"Text", "Tunnel"}:
+            continue
+        try:
+            geometry = get_component_geometry(component, project=project)
+        except Exception:
+            continue
+        for port in geometry.ports:
+            point = (component.loc[0] + port.offset[0], component.loc[1] + port.offset[1])
+            if point == loc:
+                return component, port.name
+    return None
+
+
+def _virtual_pin_at(loc: tuple[int, int], *, tunnel_facing: str) -> RawComponent:
+    pin = component_template(
+        "Pin",
+        {
+            "facing": _OPPOSITE_FACING.get(tunnel_facing, "west"),
+            "output": "false",
+            "width": "1",
+            "tristate": "false",
+            "pull": "none",
+            "label": "",
+            "labelloc": "north",
+            "labelfont": "Dialog plain 12",
+            "labelcolor": "#000000",
+        },
+        lib="0",
+    )
+    pin.loc = loc
+    return pin
+
+
+def _is_center_port(
+    component: RawComponent,
+    port_name: str,
+    *,
+    project: RawProject | None = None,
+) -> bool:
+    try:
+        geometry = get_component_geometry(component, project=project)
+    except Exception:
+        return False
+    for port in geometry.ports:
+        if port.name == port_name:
+            return port.offset == (0, 0)
+    return False
+
+
+def _component_port_width(
+    component: RawComponent,
+    port_name: str,
+    *,
+    project: RawProject | None = None,
+) -> int:
+    geometry = get_component_geometry(component, project=project)
+    port = geometry.port(port_name)
+    try:
+        return int(port.width or 1)
+    except Exception:
+        return 1
+
+
+def _tunnel_slot_step(
+    label: str,
+    width: int,
+    *,
+    facing: str,
+    project: RawProject | None = None,
+) -> int:
+    tunnel = component_template("Tunnel", _tunnel_attrs(label, width, facing=facing), lib="0")
+    left, right, top, bottom = component_extents(tunnel, project=project)
+    span = top + bottom if facing in {"east", "west"} else left + right
+    return max(20, _tunnel_snap10(span + 10))
+
+
+def _slot_candidates(step: int, *, limit: int = 240) -> tuple[int, ...]:
+    values = [0]
+    current = step
+    while current <= limit:
+        values.extend((current, -current))
+        current += step
+    return tuple(values)
+
+
+def _reserve_tunnel_slot(key: tuple[object, ...], step: int) -> int:
+    used = _TUNNEL_SLOT_STATE[key]
+    for offset in _slot_candidates(step):
+        if offset in used:
+            continue
+        used.add(offset)
+        return offset
+    offset = step * (len(used) + 1)
+    used.add(offset)
+    return offset
+
+
+def _preferred_slot_offsets(preferred: int, step: int, *, limit: int = 240) -> tuple[int, ...]:
+    seen: set[int] = set()
+    values: list[int] = []
+    for base in _slot_candidates(step, limit=limit):
+        candidate = preferred + base
+        if candidate in seen or candidate < -limit or candidate > limit:
+            continue
+        seen.add(candidate)
+        values.append(candidate)
+    return tuple(values)
+
+
+def _wire_points(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
+    if start[0] != end[0] and start[1] != end[1]:
+        raise ValueError(f"non-orthogonal wire segment: {start} -> {end}")
+    if start[0] == end[0]:
+        step = 10 if end[1] >= start[1] else -10
+        return [(start[0], y) for y in range(start[1], end[1] + step, step)]
+    step = 10 if end[0] >= start[0] else -10
+    return [(x, start[1]) for x in range(start[0], end[0] + step, step)]
+
+
+def _path_points(path: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    points: list[tuple[int, int]] = []
+    for index in range(len(path) - 1):
+        segment = _wire_points(path[index], path[index + 1])
+        if index:
+            segment = segment[1:]
+        points.extend(segment)
+    return points
+
+
+def _occupied_attachment_points(
+    circuit: RawCircuit,
+    *,
+    project: RawProject | None = None,
+) -> set[tuple[int, int]]:
+    points: set[tuple[int, int]] = set()
+    for wire in circuit.wires:
+        points.update(_wire_points(tuple(wire.start), tuple(wire.end)))
+    for component in circuit.components:
+        if component.name == "Text":
+            continue
+        try:
+            geometry = get_component_geometry(component, project=project)
+        except Exception:
+            continue
+        for port in geometry.ports:
+            points.add((component.loc[0] + port.offset[0], component.loc[1] + port.offset[1]))
+    return points
+
+
+def _center_port_tunnel(
+    circuit: RawCircuit,
+    component: RawComponent,
+    port_name: str,
+    label: str,
+    width: int,
+    *,
+    facing: str,
+    project: RawProject | None = None,
+) -> RawComponent:
+    port_x, port_y = component_port_point(component, port_name, project=project)
+    left, top, comp_width, comp_height = component_bounds(component, project=project)
+    right = left + comp_width
+    bottom = top + comp_height
+    attrs = _tunnel_attrs(label, width, facing=facing)
+    tunnel_template = component_template("Tunnel", attrs, lib="0")
+    t_left, t_right, t_top, t_bottom = component_extents(tunnel_template, project=project)
+    slot_step = _tunnel_slot_step(label, width, facing=facing, project=project)
+    preferred_offset = _reserve_tunnel_slot((id(circuit), id(component), port_name, facing), slot_step)
+    clearance = 20
+    stub = 10
+    others = [other for other in circuit.components if other.name != "Text"]
+
+    if port_x == left:
+        place_side = "west"
+    elif port_x == right:
+        place_side = "east"
+    elif port_y == top:
+        place_side = "north"
+    elif port_y == bottom:
+        place_side = "south"
+    else:
+        place_side = _OPPOSITE_FACING.get(facing, facing)
+
+    def overlaps(loc: tuple[int, int]) -> bool:
+        candidate = component_template("Tunnel", attrs, lib="0")
+        candidate.loc = loc
+        candidate_bounds = component_bounds(candidate, project=project)
+        for other in others:
+            other_bounds = component_bounds(other, project=project)
+            if max(candidate_bounds[0], other_bounds[0]) < min(candidate_bounds[0] + candidate_bounds[2], other_bounds[0] + other_bounds[2]) and max(candidate_bounds[1], other_bounds[1]) < min(candidate_bounds[1] + candidate_bounds[3], other_bounds[1] + other_bounds[3]):
+                return True
+        return False
+
+    chosen: tuple[tuple[int, int], int] | None = None
+    for tangent_offset in _preferred_slot_offsets(preferred_offset, slot_step):
+        if place_side == "east":
+            loc = (right + clearance + t_left, port_y + tangent_offset)
+        elif place_side == "west":
+            loc = (left - clearance - t_right, port_y + tangent_offset)
+        elif place_side == "north":
+            loc = (port_x + tangent_offset, top - clearance - t_bottom)
+        else:
+            loc = (port_x + tangent_offset, bottom + clearance + t_top)
+        loc = (_tunnel_snap10(loc[0]), _tunnel_snap10(loc[1]))
+        if not overlaps(loc):
+            chosen = (loc, tangent_offset)
+            break
+
+    if chosen is None:
+        tangent_offset = preferred_offset
+        if place_side == "east":
+            loc = (right + clearance + t_left, port_y + tangent_offset)
+        elif place_side == "west":
+            loc = (left - clearance - t_right, port_y + tangent_offset)
+        elif place_side == "north":
+            loc = (port_x + tangent_offset, top - clearance - t_bottom)
+        else:
+            loc = (port_x + tangent_offset, bottom + clearance + t_top)
+        loc = (_tunnel_snap10(loc[0]), _tunnel_snap10(loc[1]))
+        chosen = (loc, tangent_offset)
+
+    loc, tangent_offset = chosen
+    tunnel = add_component(circuit, "Tunnel", loc, attrs, lib="0")
+
+    if place_side in {"east", "west"}:
+        exit_x = _tunnel_snap10(right + stub if place_side == "east" else left - stub)
+        bend = (exit_x, _tunnel_snap10(port_y + tangent_offset))
+        path = [(port_x, port_y), (exit_x, port_y), bend, loc]
+    else:
+        exit_y = _tunnel_snap10(top - stub if place_side == "north" else bottom + stub)
+        bend = (_tunnel_snap10(port_x + tangent_offset), exit_y)
+        path = [(port_x, port_y), (port_x, exit_y), bend, loc]
+    add_polyline(circuit, path)
+    return tunnel
+
+
+def _hang_tunnel_on_port(
+    circuit: RawCircuit,
+    component: RawComponent,
+    port_name: str,
+    label: str,
+    width: int,
+    *,
+    facing: str,
+    preferred_offset: int = 0,
+    project: RawProject | None = None,
+) -> RawComponent:
+    port_point, far_point = component_port_lead(component, port_name, distance=20, project=project)
+    dx = far_point[0] - port_point[0]
+    dy = far_point[1] - port_point[1]
+    if dx != 0:
+        normal = (1 if dx > 0 else -1, 0)
+        tangent = (0, 1)
+    elif dy != 0:
+        normal = (0, 1 if dy > 0 else -1)
+        tangent = (1, 0)
+    else:
+        normal = {
+            "west": (1, 0),
+            "east": (-1, 0),
+            "north": (0, 1),
+            "south": (0, -1),
+        }.get(facing, (1, 0))
+        tangent = (0, 1) if normal[0] else (1, 0)
+
+    occupied = _occupied_attachment_points(circuit, project=project)
+    preferred = _tunnel_snap10(preferred_offset)
+    offset_candidates = [0]
+    if preferred != 0:
+        offset_candidates.append(preferred)
+    for step in range(10, 90, 10):
+        offset_candidates.extend((step, -step))
+    seen: set[int] = set()
+    offset_candidates = [value for value in offset_candidates if not (value in seen or seen.add(value))]
+
+    for lead_distance in (10, 20, 30, 40):
+        lead_point = (
+            port_point[0] + normal[0] * lead_distance,
+            port_point[1] + normal[1] * lead_distance,
+        )
+        for offset in offset_candidates:
+            loc = (
+                lead_point[0] + tangent[0] * offset,
+                lead_point[1] + tangent[1] * offset,
+            )
+            loc = (_tunnel_snap10(loc[0]), _tunnel_snap10(loc[1]))
+            path = [port_point, lead_point] if loc == lead_point else [port_point, lead_point, loc]
+            if any(point != port_point and point in occupied for point in _path_points(path)):
+                continue
+            tunnel = add_component(circuit, "Tunnel", loc, _tunnel_attrs(label, width, facing=facing), lib="0")
+            add_polyline(circuit, path)
+            return tunnel
+
+    lead_point = (
+        port_point[0] + normal[0] * 10,
+        port_point[1] + normal[1] * 10,
+    )
+    loc = (
+        _tunnel_snap10(lead_point[0] + tangent[0] * preferred),
+        _tunnel_snap10(lead_point[1] + tangent[1] * preferred),
+    )
+    path = [port_point, lead_point] if loc == lead_point else [port_point, lead_point, loc]
+    tunnel = add_component(circuit, "Tunnel", loc, _tunnel_attrs(label, width, facing=facing), lib="0")
+    add_polyline(circuit, path)
+    return tunnel
+
+
 def add_tunnel_to_port(
     circuit: RawCircuit,
     component: RawComponent,
@@ -623,11 +1084,56 @@ def add_tunnel_to_port(
     width: int,
     *,
     project: RawProject | None = None,
+    facing: str | None = None,
 ) -> tuple[int, int]:
-    port_point, lead_point = component_port_lead(component, port_name, project=project)
-    add_tunnel(circuit, lead_point, label, width, facing=_lead_facing(port_point, lead_point))
-    add_wire(circuit, lead_point, port_point)
-    return lead_point
+    resolved_facing = attachment_facing_for_port(component, port_name, project=project)
+    if _is_center_port(component, port_name, project=project):
+        tunnel = _center_port_tunnel(
+            circuit,
+            component,
+            port_name,
+            label,
+            width,
+            facing=facing or resolved_facing,
+            project=project,
+        )
+        return tunnel.loc
+    preferred_offset = _reserve_tunnel_slot(
+        (id(circuit), id(component), resolved_facing),
+        _tunnel_slot_step(label, width, facing=resolved_facing, project=project),
+    )
+    tunnel = _hang_tunnel_on_port(
+        circuit,
+        component,
+        port_name,
+        label,
+        width,
+        facing=resolved_facing,
+        preferred_offset=preferred_offset,
+        project=project,
+    )
+    return tunnel.loc
+
+
+def add_tunnel_on_port(
+    circuit: RawCircuit,
+    component: RawComponent,
+    port_name: str,
+    label: str,
+    *,
+    facing: str | None = None,
+    project: RawProject | None = None,
+) -> tuple[int, int]:
+    width = _component_port_width(component, port_name, project=project)
+    return add_tunnel_to_port(
+        circuit,
+        component,
+        port_name,
+        label,
+        width,
+        project=project,
+        facing=facing,
+    )
 
 
 def add_constant_to_port(
@@ -657,12 +1163,341 @@ def add_polyline(circuit: RawCircuit, points: list[tuple[int, int]] | tuple[tupl
         if compact and point == compact[-1]:
             continue
         compact.append(point)
+    orthogonal: list[tuple[int, int]] = []
+    for point in compact:
+        if not orthogonal:
+            orthogonal.append(point)
+            continue
+        start = orthogonal[-1]
+        if start[0] != point[0] and start[1] != point[1]:
+            bend = (point[0], start[1])
+            if bend != start and bend != point:
+                orthogonal.append(bend)
+        if point != orthogonal[-1]:
+            orthogonal.append(point)
     added: list[RawWire] = []
-    for start, end in zip(compact, compact[1:], strict=False):
+    for start, end in zip(orthogonal, orthogonal[1:], strict=False):
         wire = RawWire(start=start, end=end)
         circuit.wires.append(wire)
         added.append(wire)
     return added
+
+
+def _port_guard_points(
+    circuit: RawCircuit,
+    *,
+    project: RawProject | None = None,
+    exclude: set[tuple[int, int]] | None = None,
+    grid: int = 10,
+    steps: int = 4,
+) -> set[tuple[int, int]]:
+    excluded = set() if exclude is None else set(exclude)
+    guarded: set[tuple[int, int]] = set()
+    side_vectors = {
+        "left": (-grid, 0),
+        "right": (grid, 0),
+        "top": (0, -grid),
+        "bottom": (0, grid),
+    }
+    for component in circuit.components:
+        if component.name in {"Text", "Tunnel"}:
+            continue
+        try:
+            geometry = get_component_geometry(component, project=project)
+        except Exception:
+            continue
+        for port in geometry.ports:
+            point = (component.loc[0] + port.offset[0], component.loc[1] + port.offset[1])
+            if point in excluded:
+                continue
+            guarded.add(point)
+            dx, dy = side_vectors[_nearest_side_name(geometry.bounds, port.offset)]
+            for step in range(1, steps + 1):
+                guarded.add((point[0] + dx * step, point[1] + dy * step))
+    return guarded
+
+
+def _route_between_points(
+    circuit: RawCircuit,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    project: RawProject | None = None,
+    extra_blocked: set[tuple[int, int]] | None = None,
+    extra_allowed: set[tuple[int, int]] | None = None,
+    margin: int = 160,
+    component_padding: int = 10,
+    avoid_wires: bool = False,
+) -> tuple[tuple[int, int], ...]:
+    path = route_circuit_path(
+        circuit,
+        start,
+        end,
+        project=project,
+        margin=margin,
+        component_padding=component_padding,
+        avoid_wires=avoid_wires,
+        extra_blocked=extra_blocked,
+        extra_allowed={start, end, *(extra_allowed or set())},
+    )
+    if path is None:
+        raise RuntimeError(f"failed to route wire: {start} -> {end}")
+    return path
+
+
+def connect_points_routed(
+    circuit: RawCircuit,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    project: RawProject | None = None,
+    via: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
+    margin: int = 160,
+    component_padding: int = 10,
+    avoid_wires: bool = False,
+    protect_ports: bool = True,
+) -> list[RawWire]:
+    waypoints = [tuple(start), *[tuple(point) for point in via], tuple(end)]
+    allowed = set(waypoints)
+    blocked = _port_guard_points(circuit, project=project, exclude=allowed) if protect_ports else set()
+    routed = [waypoints[0]]
+    for target in waypoints[1:]:
+        path = _route_between_points(
+            circuit,
+            routed[-1],
+            target,
+            project=project,
+            extra_blocked=blocked,
+            extra_allowed=allowed,
+            margin=margin,
+            component_padding=component_padding,
+            avoid_wires=avoid_wires,
+        )
+        routed.extend(path[1:])
+    return add_polyline(circuit, routed)
+
+
+def _port_lead_candidates(
+    component: RawComponent,
+    port_name: str,
+    *,
+    target: tuple[int, int],
+    distance: int,
+    project: RawProject | None = None,
+) -> tuple[tuple[int, int], list[tuple[int, int]]]:
+    port_point = component_port_point(component, port_name, project=project)
+    default_point, default_lead = component_port_lead(component, port_name, distance=distance, project=project)
+    candidates = [default_lead]
+    try:
+        geometry = get_component_geometry(component, project=project)
+        port = geometry.port(port_name)
+    except Exception:
+        return default_point, candidates
+
+    # Some Logisim components, notably Negator, expose their useful terminal as
+    # a single center port.  For those, "nearest side" is ambiguous; choose an
+    # escape direction based on the connection target and keep the other
+    # directions as fallbacks.
+    if len(geometry.ports) == 1 and port.offset == (0, 0):
+        dx = target[0] - port_point[0]
+        dy = target[1] - port_point[1]
+        preferred: list[tuple[int, int]] = []
+        if abs(dx) >= abs(dy) and dx != 0:
+            preferred.append((1 if dx > 0 else -1, 0))
+        if dy != 0:
+            preferred.append((0, 1 if dy > 0 else -1))
+        for direction in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            if direction not in preferred:
+                preferred.append(direction)
+        for direction in preferred:
+            lead = (port_point[0] + direction[0] * distance, port_point[1] + direction[1] * distance)
+            if lead not in candidates:
+                candidates.append(lead)
+
+    return port_point, candidates
+
+
+def connect_ports_routed(
+    circuit: RawCircuit,
+    src_component: RawComponent,
+    src_port: str,
+    dst_component: RawComponent,
+    dst_port: str,
+    *,
+    project: RawProject | None = None,
+    lead_distance: int = 30,
+    margin: int = 160,
+    component_padding: int = 10,
+    avoid_wires: bool = False,
+) -> list[RawWire]:
+    src_point = component_port_point(src_component, src_port, project=project)
+    dst_point = component_port_point(dst_component, dst_port, project=project)
+    src_point, src_leads = _port_lead_candidates(
+        src_component,
+        src_port,
+        target=dst_point,
+        distance=lead_distance,
+        project=project,
+    )
+    dst_point, dst_leads = _port_lead_candidates(
+        dst_component,
+        dst_port,
+        target=src_point,
+        distance=lead_distance,
+        project=project,
+    )
+    blocked = _port_guard_points(circuit, project=project, exclude={src_point, dst_point})
+    wire_points = _circuit_wire_points(circuit)
+    last_failure: tuple[tuple[int, int], tuple[int, int]] | None = None
+    avoid_options = [avoid_wires]
+    if avoid_wires:
+        avoid_options.append(False)
+    for avoid_existing_wires in avoid_options:
+        for padding in sorted({component_padding, max(0, component_padding // 2), 0}, reverse=True):
+            for src_lead in src_leads:
+                for dst_lead in dst_leads:
+                    if src_lead != src_point and src_lead in wire_points:
+                        last_failure = (src_lead, dst_lead)
+                        continue
+                    if dst_lead != dst_point and dst_lead in wire_points:
+                        last_failure = (src_lead, dst_lead)
+                        continue
+                    allowed = {src_point, src_lead, dst_point, dst_lead}
+                    path = route_circuit_path(
+                        circuit,
+                        src_lead,
+                        dst_lead,
+                        project=project,
+                        margin=margin,
+                        component_padding=padding,
+                        avoid_wires=avoid_existing_wires,
+                        extra_blocked=blocked,
+                        extra_allowed=allowed,
+                    )
+                    if path is None:
+                        last_failure = (src_lead, dst_lead)
+                        continue
+                    return add_polyline(circuit, [src_point, src_lead, *path[1:-1], dst_lead, dst_point])
+    failed_start, failed_end = last_failure or (src_leads[0], dst_leads[0])
+    raise RuntimeError(f"failed to route wire: {failed_start} -> {failed_end}")
+
+
+def _port_point(component: RawComponent, port_name: str, *, project: RawProject | None = None) -> tuple[int, int]:
+    geometry = get_component_geometry(component, project=project)
+    port = geometry.port(port_name)
+    return (component.loc[0] + port.offset[0], component.loc[1] + port.offset[1])
+
+
+def _tunnel_width(component: RawComponent) -> int:
+    raw = component.get("width", "1") or "1"
+    try:
+        return int(raw)
+    except Exception:
+        return 1
+
+
+def _wire_segment_points(wire: RawWire, *, grid: int = 10) -> set[tuple[int, int]]:
+    points: set[tuple[int, int]] = set()
+    if wire.start[0] == wire.end[0]:
+        x = wire.start[0]
+        y0, y1 = sorted((wire.start[1], wire.end[1]))
+        for y in range(y0, y1 + grid, grid):
+            points.add((x, y))
+        return points
+    if wire.start[1] == wire.end[1]:
+        y = wire.start[1]
+        x0, x1 = sorted((wire.start[0], wire.end[0]))
+        for x in range(x0, x1 + grid, grid):
+            points.add((x, y))
+        return points
+    return {tuple(wire.start), tuple(wire.end)}
+
+
+def _circuit_wire_points(circuit: RawCircuit, *, grid: int = 10) -> set[tuple[int, int]]:
+    points: set[tuple[int, int]] = set()
+    for wire in circuit.wires:
+        points.update(_wire_segment_points(wire, grid=grid))
+    return points
+
+
+def _connected_wire_points(circuit: RawCircuit, origin: tuple[int, int], *, grid: int = 10) -> set[tuple[int, int]]:
+    endpoint_wires: defaultdict[tuple[int, int], list[RawWire]] = defaultdict(list)
+    for wire in circuit.wires:
+        endpoint_wires[tuple(wire.start)].append(wire)
+        endpoint_wires[tuple(wire.end)].append(wire)
+    visited_points = {origin}
+    visited_wires: set[int] = set()
+    allowed = {origin}
+    queue = [origin]
+    while queue:
+        point = queue.pop()
+        for wire in endpoint_wires.get(point, []):
+            wire_id = id(wire)
+            if wire_id in visited_wires:
+                continue
+            visited_wires.add(wire_id)
+            allowed.update(_wire_segment_points(wire, grid=grid))
+            other = tuple(wire.end) if tuple(wire.start) == point else tuple(wire.start)
+            if other not in visited_points:
+                visited_points.add(other)
+                queue.append(other)
+    return allowed
+
+
+def _find_reusable_tunnel_connection(
+    circuit: RawCircuit,
+    anchor: RawComponent,
+    port_name: str,
+    *,
+    label: str,
+    width: int,
+    project: RawProject | None = None,
+    component_padding: int = 12,
+    max_path_length: int = 1200,
+) -> tuple[RawComponent, tuple[tuple[int, int], ...]] | None:
+    start = _port_point(anchor, port_name, project=project)
+    candidates: list[tuple[int, int, RawComponent, tuple[tuple[int, int], ...]]] = []
+    for component in circuit.components:
+        if component.name != "Tunnel":
+            continue
+        if (component.get("label", "") or "") != label:
+            continue
+        if _tunnel_width(component) != width:
+            continue
+        shared_points = _connected_wire_points(circuit, tuple(component.loc))
+        near_points = sorted(
+            shared_points,
+            key=lambda point: (
+                abs(point[0] - start[0]) + abs(point[1] - start[1]),
+                abs(point[0] - component.loc[0]) + abs(point[1] - component.loc[1]),
+                point[1],
+                point[0],
+            ),
+        )
+        for goal in near_points[:96]:
+            path = route_circuit_path(
+                circuit,
+                start,
+                goal,
+                project=project,
+                component_padding=component_padding,
+                grid=10,
+                margin=400,
+                extra_allowed=shared_points,
+                wire_junction_allowed={start, *shared_points},
+            )
+            if path is None:
+                continue
+            path_length = sum(abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in zip(path, path[1:], strict=False))
+            if path_length > max_path_length:
+                continue
+            distance = abs(goal[0] - start[0]) + abs(goal[1] - start[1])
+            candidates.append((path_length, distance, component, path))
+            break
+    if not candidates:
+        return None
+    _, _, tunnel, path = min(candidates, key=lambda item: (item[0], item[1], item[2].loc[1], item[2].loc[0]))
+    return tunnel, path
 
 
 def _remember_attachment(
@@ -816,24 +1651,45 @@ def attach_component_to_port(
     component_padding: int = 10,
     tangent_limit: int = 240,
     distance_limit: int = 240,
+    preferred_tangent_offset: int | None = None,
     follow_port_facing: bool = True,
     attached_port_name: str | None = None,
 ) -> RawComponent:
     attached = component_template(name, attrs, lib=lib)
     if follow_port_facing and attached.get("facing") is not None:
         attached.set("facing", attachment_facing_for_port(anchor, port_name, project=project))
-    placement = place_attached_component(
-        circuit,
-        anchor,
-        port_name,
-        attached,
-        attached_port_name=attached_port_name,
-        project=project,
-        distance=distance,
-        component_padding=component_padding,
-        tangent_limit=tangent_limit,
-        distance_limit=distance_limit,
-    )
+    try:
+        placement = place_attached_component(
+            circuit,
+            anchor,
+            port_name,
+            attached,
+            attached_port_name=attached_port_name,
+            project=project,
+            distance=distance,
+            component_padding=component_padding,
+            tangent_limit=tangent_limit,
+            distance_limit=distance_limit,
+            preferred_tangent_offset=preferred_tangent_offset,
+        )
+    except RuntimeError:
+        if name != "Tunnel":
+            raise
+        label = attached.get("label", "") or ""
+        reusable = _find_reusable_tunnel_connection(
+            circuit,
+            anchor,
+            port_name,
+            label=label,
+            width=_tunnel_width(attached),
+            project=project,
+            component_padding=component_padding,
+        )
+        if reusable is None:
+            raise
+        tunnel, path = reusable
+        add_polyline(circuit, list(path))
+        return tunnel
     attached.loc = placement.loc
     if follow_port_facing and attached.get("facing") is not None:
         attached.set("facing", placement.facing)
@@ -1100,13 +1956,75 @@ def add_subcircuit_near_component(
     )
 
 
-def add_tunnel(circuit: RawCircuit, loc: tuple[int, int], label: str, width: int, *, facing: str = "west") -> None:
-    add_component(
+def add_tunnel(
+    circuit: RawCircuit,
+    loc: tuple[int, int],
+    label: str,
+    width: int,
+    *,
+    facing: str | None = None,
+    project: RawProject | None = None,
+) -> RawComponent:
+    facing_hint = facing or "east"
+    matched = _find_port_at_point(circuit, loc, project=project)
+    if matched is not None:
+        anchor, port_name = matched
+        resolved_facing = attachment_facing_for_port(anchor, port_name, project=project)
+        if _is_center_port(anchor, port_name, project=project):
+            return _center_port_tunnel(
+                circuit,
+                anchor,
+                port_name,
+                label,
+                width,
+                facing=facing or resolved_facing,
+                project=project,
+            )
+        slot_key = (id(circuit), id(anchor), resolved_facing)
+    else:
+        anchor = _virtual_pin_at(loc, tunnel_facing=facing_hint)
+        port_name = "io"
+        resolved_facing = facing_hint
+        if _is_center_port(anchor, port_name, project=project):
+            return _center_port_tunnel(
+                circuit,
+                anchor,
+                port_name,
+                label,
+                width,
+                facing=resolved_facing,
+                project=project,
+            )
+        slot_key = (id(circuit), loc, resolved_facing)
+    preferred_offset = _reserve_tunnel_slot(
+        slot_key,
+        _tunnel_slot_step(label, width, facing=resolved_facing, project=project),
+    )
+    if matched is not None:
+        return _hang_tunnel_on_port(
+            circuit,
+            anchor,
+            port_name,
+            label,
+            width,
+            facing=resolved_facing,
+            preferred_offset=preferred_offset,
+            project=project,
+        )
+    return attach_component_to_port(
         circuit,
+        anchor,
+        port_name,
         "Tunnel",
-        loc,
-        {"facing": facing, "width": str(width), "label": label, "labelfont": "Dialog plain 12"},
+        _tunnel_attrs(label, width, facing=resolved_facing),
         lib="0",
+        project=project,
+        distance=_preferred_tunnel_distance(anchor, port_name, project=project),
+        component_padding=12,
+        tangent_limit=max(180, abs(preferred_offset) + 40),
+        distance_limit=160,
+        preferred_tangent_offset=preferred_offset,
+        attached_port_name="io",
     )
 
 
@@ -1367,8 +2285,79 @@ def connect_pin_to_tunnel(
     width: int,
     facing: str,
 ) -> None:
-    add_tunnel(circuit, tunnel_loc, label, width, facing=facing)
-    add_wire(circuit, pin_loc, tunnel_loc)
+    dx = tunnel_loc[0] - pin_loc[0]
+    dy = tunnel_loc[1] - pin_loc[1]
+    if abs(dx) >= abs(dy) and dx != 0:
+        axis = (1 if dx > 0 else -1, 0)
+        tangent = (0, 1)
+        preferred_distance = max(30, abs(dx))
+        preferred_tangent = snap10(dy)
+    elif dy != 0:
+        axis = (0, 1 if dy > 0 else -1)
+        tangent = (1, 0)
+        preferred_distance = max(30, abs(dy))
+        preferred_tangent = snap10(dx)
+    else:
+        axis = {
+            "east": (-1, 0),
+            "west": (1, 0),
+            "north": (0, 1),
+            "south": (0, -1),
+        }.get(facing, (1, 0))
+        tangent = (0, 1) if axis[0] else (1, 0)
+        preferred_distance = 30
+        preferred_tangent = 0
+
+    tunnel_attrs = _tunnel_attrs(label, width, facing=facing)
+    existing = [component for component in circuit.components if component.name != "Text"]
+
+    def candidate_loc(distance: int, tangent_offset: int) -> tuple[int, int]:
+        return (
+            pin_loc[0] + axis[0] * distance + tangent[0] * tangent_offset,
+            pin_loc[1] + axis[1] * distance + tangent[1] * tangent_offset,
+        )
+
+    def tangent_offsets(limit: int = 120) -> list[int]:
+        preferred = snap10(preferred_tangent)
+        offsets = [preferred]
+        for delta in range(10, limit + 10, 10):
+            plus = preferred + delta
+            minus = preferred - delta
+            if plus <= limit:
+                offsets.append(plus)
+            if minus >= -limit:
+                offsets.append(minus)
+        return offsets
+
+    chosen = candidate_loc(preferred_distance, preferred_tangent)
+    for extra_distance in range(0, 181, 10):
+        distance = preferred_distance + extra_distance
+        for tangent_offset in tangent_offsets():
+            loc = candidate_loc(distance, tangent_offset)
+            candidate = component_template("Tunnel", tunnel_attrs, lib="0")
+            candidate.loc = loc
+            candidate_bounds = component_bounds(candidate, padding=12)
+            if any(
+                _bounds_overlap_local(candidate_bounds, component_bounds(other, padding=12))
+                for other in existing
+            ):
+                continue
+            chosen = loc
+            extra_distance = 999999
+            break
+        else:
+            continue
+        break
+
+    path = [pin_loc]
+    if pin_loc[0] != chosen[0] and pin_loc[1] != chosen[1]:
+        if axis[0]:
+            path.append((pin_loc[0] + axis[0] * max(30, abs(chosen[0] - pin_loc[0])), pin_loc[1]))
+        else:
+            path.append((pin_loc[0], pin_loc[1] + axis[1] * max(30, abs(chosen[1] - pin_loc[1]))))
+    path.append(chosen)
+    add_tunnel(circuit, chosen, label, width, facing=facing)
+    add_polyline(circuit, path)
 
 
 def single_bit_splitter_attrs(bus_width: int, bit_index: int, facing: str) -> dict[str, str]:
@@ -1667,10 +2656,10 @@ def splitter_selected_bits(comp: RawComponent) -> list[int]:
 
 def set_splitter_single_bit(comp: RawComponent, incoming: int, bit_index: int) -> None:
     set_attr(comp, "incoming", str(incoming))
-    for attr in comp.attrs:
-        if attr.name.startswith("bit"):
-            attr.value = "none"
-    set_attr(comp, f"bit{bit_index}", "0")
+    set_attr(comp, "fanout", "1")
+    comp.attrs = [attr for attr in comp.attrs if not attr.name.startswith("bit")]
+    for index in range(incoming):
+        set_attr(comp, f"bit{index}", "0" if index == bit_index else "none")
 
 
 def set_splitter_two_way(comp: RawComponent, incoming: int, low_bits: list[int], high_bits: list[int]) -> None:
@@ -1678,24 +2667,24 @@ def set_splitter_two_way(comp: RawComponent, incoming: int, low_bits: list[int],
     high = set(high_bits)
     set_attr(comp, "incoming", str(incoming))
     set_attr(comp, "fanout", "2")
-    for attr in comp.attrs:
-        if attr.name.startswith("bit"):
-            index = int(attr.name[3:])
-            if index in low:
-                attr.value = "0"
-            elif index in high:
-                attr.value = "1"
-            else:
-                attr.value = "none"
+    comp.attrs = [attr for attr in comp.attrs if not attr.name.startswith("bit")]
+    for index in range(incoming):
+        if index in low:
+            value = "0"
+        elif index in high:
+            value = "1"
+        else:
+            value = "none"
+        set_attr(comp, f"bit{index}", value)
 
 
 def set_splitter_extract(comp: RawComponent, incoming: int, selected: list[int]) -> None:
     keep = set(selected)
     set_attr(comp, "incoming", str(incoming))
-    for attr in comp.attrs:
-        if attr.name.startswith("bit"):
-            index = int(attr.name[3:])
-            attr.value = "0" if index in keep else "none"
+    set_attr(comp, "fanout", "1")
+    comp.attrs = [attr for attr in comp.attrs if not attr.name.startswith("bit")]
+    for index in range(incoming):
+        set_attr(comp, f"bit{index}", "0" if index in keep else "none")
 
 
 def add_named_bus_rebuilder(

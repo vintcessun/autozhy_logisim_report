@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from .geometry import get_component_geometry
 from .logic_builder import LogicCircuitBuilder
 from .model import RawCircuit, RawComponent, RawProject
 from .rebuild_support import (
+    add_tunnel_to_port,
     attach_bit_extender_to_port,
     attach_component_to_port,
     attach_subcircuit_to_port,
@@ -134,7 +136,15 @@ class CircuitTemplate:
         width: int,
         source: SelectorSource = "base",
     ) -> None:
-        pin_loc = self.loc(key, source=source)
+        component = self.component(key, source=source)
+        try:
+            geometry = get_component_geometry(component)
+        except Exception:
+            geometry = None
+        if geometry is not None and len(geometry.ports) == 1:
+            add_tunnel_to_port(self.circuit, component, geometry.ports[0].name, label, width)
+            return
+        pin_loc = component.loc
         dx, dy, facing = _side_tunnel_spec(side)
         connect_pin_to_tunnel(
             self.circuit,

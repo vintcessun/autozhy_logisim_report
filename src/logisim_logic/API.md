@@ -210,6 +210,30 @@
 - `compare_projects(lhs, rhs)`, `compare_project_files(lhs_path, rhs_path)`
   - 对比两个工程或两个文件。
 
+### 位宽错误诊断
+
+- `WidthDeterminant`
+  - 某个端口在某个坐标上施加的位宽约束。
+  - 适合解释“是谁把这根 bundle 认成了 1 位 / 10 位”。
+
+- `WidthConflict`
+  - 一组位宽冲突的结构化结果。
+  - 会同时给出冲突点、相关导线索引、以及导致冲突的 determinant 列表。
+
+- `find_width_conflicts(circuit, project=None)`
+  - 按 Logisim 的 wire bundle / splitter / tunnel 语义分析位宽冲突。
+  - 适合定位 Logisim 里会出现橙红提示的导线问题。
+  - 返回值里：
+    - `kind="bundle"` 表示整束 bundle 上位宽不兼容，这通常对应橙红导线。
+    - `kind="point"` 表示同一坐标处多个端口宽度互相矛盾。
+
+- `find_invalid_wire_indexes(circuit, project=None)`
+  - 返回所有属于失效 bundle 的导线索引。
+  - 当你想把诊断结果映射回 `circuit.wires[index]` 时，这是最直接的入口。
+
+- `has_width_conflicts(circuit, project=None)`
+  - 只关心“是否存在位宽冲突”时用它。
+
 ### ROM 与编码
 
 - `rom_contents_from_words(...)`
@@ -608,6 +632,8 @@ toolbar 里的单个条目。
 - `route_circuit_path(circuit, start, goal, project=None, ...)`
   - 在现有电路障碍物之间找一条可行折线。
   - 适合调试单条线怎么走，不直接面对所有网络整体布线。
+  - 默认可穿越已有导线，但不会把普通十字交叉当成电气连接。
+  - 如果需要完全绕开已有导线，可显式传 `avoid_wires=True`。
 
 - `place_attached_component(circuit, anchor, port_name, attached, ..., attached_port_name=None)`
   - 自动求解附着元件位置。
@@ -1169,6 +1195,13 @@ toolbar 里的单个条目。
 - `detunnelize_circuit(circuit, keep_labels=None, project=None, passes=2)`
   - 尝试把同名 tunnel 对重新还原成真实导线。
   - 用于减少不必要的 tunnel。
+  - 更适合“整张图批量去 tunnel”的场景。
+
+- `detunnelize_selected_tunnels(circuit, remove_labels=None, keep_labels=None, remove_predicate=None, keep_predicate=None, project=None, ...)`
+  - 只处理你明确选中的 tunnel 标签或 tunnel 实例。
+  - 适合“保留模板输入输出 tunnel，只清理新增的内部中间 tunnel”。
+  - 推荐策略是：先记录模板里原本存在的 tunnel 标签，只删除模板里不存在的内部标签。
+  - 如果新增 tunnel 与模板 tunnel 同名，说明它在接模板语义接口，这一整组都应保留，不要只删一半。
 
 - `snap10(value)`
   - 对齐到 Logisim 常见 10 像素网格。
@@ -1250,6 +1283,16 @@ toolbar 里的单个条目。
 
 - `add_polyline(circuit, points)`
   - 加一条折线。
+
+- `connect_points_routed(circuit, start, end, project=None, ...)`
+  - 推荐的点到点自动布线接口。
+  - 默认避开元件与无关端口，同时允许普通导线交叉。
+  - 当 tunnel 只是临时跳线、没有语义名时，优先考虑这个接口。
+
+- `connect_ports_routed(circuit, src_component, src_port, dst_component, dst_port, project=None, ...)`
+  - 推荐的端口到端口自动布线接口。
+  - 会先从端口拉出短引线，再做正交路由。
+  - 适合替代很多手写 `add_polyline(...)` 的端口连线。
 
 - `add_tunnel(circuit, loc, label, width, facing='west')`
   - 加一个 tunnel。

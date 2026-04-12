@@ -1,5 +1,6 @@
 from .builder import CircuitBuilder, component, orthogonal, pt
 from .compare import ProjectDiff, compare_project_files, compare_projects, project_signature
+from .diagnostics import WidthConflict, WidthDeterminant, find_invalid_wire_indexes, find_width_conflicts, has_width_conflicts
 from .geometry import ComponentGeometry, PortGeometry, get_component_geometry, get_component_visual_bounds, resolve_library_label
 from .graph import WireGraph, build_wire_graph
 from .high_level import CircuitEditor, ProjectFacade
@@ -52,6 +53,8 @@ __all__ = [
     "ComponentGeometry",
     "Direction",
     "EndpointRef",
+    "find_width_conflicts",
+    "has_width_conflicts",
     "LogicalCircuit",
     "LogicCircuitBuilder",
     "LogicInstanceSpec",
@@ -74,6 +77,8 @@ __all__ = [
     "RawToolbarItem",
     "RawWire",
     "WireGraph",
+    "WidthConflict",
+    "WidthDeterminant",
     "XmlFragment",
     "PortAttachmentPlacement",
     "build_wire_graph",
@@ -90,6 +95,7 @@ __all__ = [
     "extract_logical_circuit",
     "CircuitEditor",
     "find_component_overlaps",
+    "find_invalid_wire_indexes",
     "get_component_geometry",
     "get_component_visual_bounds",
     "attachment_facing_for_port",

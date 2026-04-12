@@ -3,11 +3,8 @@ import random
 import asyncio
 from pathlib import Path
 
-# Setup paths
+# Setup paths - 统一使用项目根目录
 project_root = Path(__file__).resolve().parent.parent
-vendor_path = project_root / "src" / "vendor"
-if str(vendor_path) not in sys.path:
-    sys.path.append(str(vendor_path))
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
@@ -34,25 +31,21 @@ def run_grading_check(target_path: Path, ref_path: Path) -> bool:
         
         # Load Oracle (Reference circuit)
         proj_ref = load_project(str(ref_path))
-        # 识别参考电路中的主逻辑电路（通常包含 A, B 输入和 16 位逻辑）
+        # 识别参考电路中的主逻辑电路
         circ_ref = next((c for c in proj_ref.circuits if "16" in c.name), proj_ref.circuits[0])
         sim_ref = LogicSimulator(extract_logical_circuit(circ_ref, project=proj_ref))
         
         # 构造 10+4 测试矩阵
         test_cases = []
-        # 4 Boundary Cases (A, B, Cin)
         test_cases.append((0, random.randint(0, 0xFFFF), random.randint(0, 1))) # 0 + X
         test_cases.append((random.randint(0, 0xFFFF), 0, random.randint(0, 1))) # X + 0
         test_cases.append((0xFFFF, random.randint(0, 0xFFFF), random.randint(0, 1))) # MAX + X
         test_cases.append((random.randint(0, 0xFFFF), 0xFFFF, random.randint(0, 1))) # X + MAX
-        # 10 Random Cases
         for _ in range(10):
             test_cases.append((random.randint(0, 0xFFFF), random.randint(0, 0xFFFF), random.randint(0, 1)))
             
         fail_count = 0
         for i, (a, b, cin) in enumerate(test_cases):
-            # 执行仿真
-            # Note: 映射 Pin 标签 (DUT: A, B, Cin -> S, Cout | REF: X, Y, C0 -> S, C16)
             out_dut = sim_dut.simulate({"A": a, "B": b, "Cin": cin})
             out_ref = sim_ref.simulate({"X": a, "Y": b, "C0": cin})
             
@@ -95,9 +88,8 @@ async def test_logic_design_integration():
     client = genai.Client(api_key=app_config.gemini.api_key, http_options={'base_url': endpoint})
     
     # 使用 Pro 模型进行高阶架构设计
-    agent = DesignAgent(client, app_config.gemini.model_pro)
+    agent = DesignAgent(client, app_config.gemini.model_pro, app_config.gemini.model_flash)
     
-    # 构造任务记录
     design_goal = info_path.read_text(encoding="utf-8").strip()
     task = TaskRecord(
         task_id="integration_001",
@@ -107,19 +99,13 @@ async def test_logic_design_integration():
     )
     
     print("\n--- Starting Design Loop ---")
-    
-    # 运行 DesignAgent
-    # Agent 内部会根据规划执行 Pro/Flash 闭环自检
     updated_task = await agent.run(task, template_path)
     
     if updated_task.status != "finished":
         pytest.fail(f"Agent internally failed: {updated_task.analysis_raw}")
     
     result_file = Path(updated_task.source_circ[0])
-    
-    # 外部黑盒差分对撞 (Matrix 10+4)
     aligned = run_grading_check(result_file, ref_path)
-    
     assert aligned, "The designed circuit is NOT functionally equivalent to the oracle."
 
 if __name__ == "__main__":

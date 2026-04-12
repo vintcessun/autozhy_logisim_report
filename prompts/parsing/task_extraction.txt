@@ -1,3 +1,0 @@
-提取实验任务的系统提示词草稿。
-待解析内容：{{text}}
-预期格式：JSON (objective, tasks: [task_name, task_type, description])

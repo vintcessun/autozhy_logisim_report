@@ -14,7 +14,9 @@ Node = tuple[str, Point]
 def _step(a: int, b: int) -> int:
     if a == b:
         return 0
-    return 10 if b > a else -10
+    delta = b - a
+    magnitude = 10 if abs(delta) % 10 == 0 else 1
+    return magnitude if delta > 0 else -magnitude
 
 
 def expand_wire(wire: RawWire) -> list[Point]:
@@ -27,8 +29,14 @@ def expand_wire(wire: RawWire) -> list[Point]:
     points: list[Point] = [(x1, y1)]
     x, y = x1, y1
     while (x, y) != (x2, y2):
-        x += dx
-        y += dy
+        if dx > 0:
+            x = min(x + dx, x2)
+        elif dx < 0:
+            x = max(x + dx, x2)
+        if dy > 0:
+            y = min(y + dy, y2)
+        elif dy < 0:
+            y = max(y + dy, y2)
         points.append((x, y))
     return points
 
@@ -124,14 +132,6 @@ def build_wire_graph(circuit: RawCircuit, split_points: Iterable[Point] = ()) ->
             nodes_at_point[point].add(node)
         for left, right in zip(points, points[1:]):
             uf.union((orientation, left), (orientation, right))
-
-    # Ensure all split points (component ports) result in a node/net
-    for point in explicit_splits:
-        if point not in nodes_at_point:
-            expanded.add(point)
-            node = ("h", point) # Default orientation
-            uf.add(node)
-            nodes_at_point[point].add(node)
 
     for point, nodes in nodes_at_point.items():
         by_orientation: defaultdict[str, list[Node]] = defaultdict(list)

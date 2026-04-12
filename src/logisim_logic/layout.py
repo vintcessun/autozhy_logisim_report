@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 import heapq
@@ -269,6 +270,28 @@ def _candidate_offsets(step: int, limit: int) -> list[int]:
     return offsets
 
 
+def _preferred_candidate_offsets(step: int, limit: int, preferred: int | None) -> list[int]:
+    if preferred is None:
+        return _candidate_offsets(step, limit)
+    snapped = _snap(preferred, step)
+    ordered: list[int] = []
+
+    def append_offset(value: int) -> None:
+        if value < -limit or value > limit or value in ordered:
+            return
+        ordered.append(value)
+
+    append_offset(snapped)
+    current = step
+    while current <= limit:
+        append_offset(snapped + current)
+        append_offset(snapped - current)
+        current += step
+    for value in _candidate_offsets(step, limit):
+        append_offset(value)
+    return ordered
+
+
 def _compact_points(points: list[Point]) -> tuple[Point, ...]:
     compact: list[Point] = []
     for point in points:
@@ -327,6 +350,51 @@ def _wire_points(circuit: RawCircuit, *, grid: int = _GRID) -> set[Point]:
     return occupied
 
 
+def _wire_occupancy(circuit: RawCircuit, *, grid: int = _GRID) -> tuple[dict[Point, set[str]], set[Point]]:
+    occupied: defaultdict[Point, set[str]] = defaultdict(set)
+    endpoints: set[Point] = set()
+    for wire in circuit.wires:
+        start = tuple(wire.start)
+        end = tuple(wire.end)
+        endpoints.add(start)
+        endpoints.add(end)
+        if start[0] == end[0]:
+            orientation = "v"
+            x = start[0]
+            y0, y1 = sorted((start[1], end[1]))
+            for y in range(y0, y1 + grid, grid):
+                occupied[(x, y)].add(orientation)
+        elif start[1] == end[1]:
+            orientation = "h"
+            y = start[1]
+            x0, x1 = sorted((start[0], end[0]))
+            for x in range(x0, x1 + grid, grid):
+                occupied[(x, y)].add(orientation)
+    return dict(occupied), endpoints
+
+
+def _port_clearance_points(
+    component: RawComponent,
+    geometry,
+    *,
+    grid: int = _GRID,
+    skip_port_name: str | None = None,
+    steps: int = 4,
+) -> set[Point]:
+    points: set[Point] = set()
+    for port in geometry.ports:
+        if skip_port_name is not None and port.name == skip_port_name:
+            continue
+        px = component.loc[0] + port.offset[0]
+        py = component.loc[1] + port.offset[1]
+        points.add((px, py))
+        side = _nearest_side(geometry.bounds, port.offset)
+        side_step = (side[0] * grid, side[1] * grid)
+        for step in range(1, steps + 1):
+            points.add((px + side_step[0] * step, py + side_step[1] * step))
+    return points
+
+
 def _component_blockers(
     circuit: RawCircuit,
     *,
@@ -349,25 +417,7 @@ def _component_blockers(
         if id(component) in ignored or component.name == "Text":
             continue
         geometry = get_component_geometry(component, project=project)
-        left = geometry.bounds[0]
-        right = geometry.bounds[0] + geometry.bounds[2]
-        top = geometry.bounds[1]
-        bottom = geometry.bounds[1] + geometry.bounds[3]
-        for port in geometry.ports:
-            px = component.loc[0] + port.offset[0]
-            py = component.loc[1] + port.offset[1]
-            openings.add((px, py))
-            side = min(
-                (
-                    (abs(port.offset[0] - left), (-grid, 0)),
-                    (abs(port.offset[0] - right), (grid, 0)),
-                    (abs(port.offset[1] - top), (0, -grid)),
-                    (abs(port.offset[1] - bottom), (0, grid)),
-                ),
-                key=lambda item: item[0],
-            )[1]
-            for step in range(1, 5):
-                openings.add((px + side[0] * step, py + side[1] * step))
+        openings.update(_port_clearance_points(component, geometry, grid=grid))
     blocked.difference_update(openings)
     return blocked
 
@@ -381,8 +431,12 @@ def route_circuit_path(
     grid: int = _GRID,
     margin: int = 80,
     component_padding: int = 10,
-    avoid_wires: bool = True,
+    avoid_wires: bool = False,
+    avoid_wire_junctions: bool = True,
+    wire_junction_allowed: set[Point] | None = None,
     ignore_components: set[int] | None = None,
+    extra_blocked: set[Point] | None = None,
+    extra_allowed: set[Point] | None = None,
 ) -> tuple[Point, ...] | None:
     blocked = _component_blockers(
         circuit,
@@ -393,6 +447,15 @@ def route_circuit_path(
     )
     if avoid_wires:
         blocked.update(_wire_points(circuit, grid=grid))
+    wire_orientations: dict[Point, set[str]] = {}
+    wire_endpoints: set[Point] = set()
+    if avoid_wire_junctions and not avoid_wires:
+        wire_orientations, wire_endpoints = _wire_occupancy(circuit, grid=grid)
+    allowed_wire_junctions = {start, goal} if wire_junction_allowed is None else set(wire_junction_allowed)
+    if extra_blocked:
+        blocked.update(extra_blocked)
+    if extra_allowed:
+        blocked.difference_update(extra_allowed)
     blocked.discard(start)
     blocked.discard(goal)
     min_x = _floor_grid(min(start[0], goal[0]) - margin, grid)
@@ -417,11 +480,24 @@ def route_circuit_path(
         if cost > costs.get((point, direction_index), float("inf")):
             continue
         for next_dir_index, (dx, dy) in enumerate(directions):
+            if (
+                wire_orientations
+                and point not in allowed_wire_junctions
+                and point in wire_orientations
+                and direction_index != -1
+                and direction_index != next_dir_index
+            ):
+                continue
             nxt = (point[0] + dx, point[1] + dy)
             if nxt[0] < min_x or nxt[0] > max_x or nxt[1] < min_y or nxt[1] > max_y:
                 continue
             if nxt in blocked and nxt != goal:
                 continue
+            if wire_orientations and nxt not in allowed_wire_junctions:
+                move_orientation = "h" if dy == 0 else "v"
+                occupied_orientations = wire_orientations.get(nxt, set())
+                if move_orientation in occupied_orientations or nxt in wire_endpoints:
+                    continue
             bend_penalty = 0.6 if direction_index != -1 and direction_index != next_dir_index else 0.0
             new_cost = cost + 1.0 + bend_penalty
             state = (nxt, next_dir_index)
@@ -446,6 +522,7 @@ def place_attached_component(
     step: int = _GRID,
     tangent_limit: int = 240,
     distance_limit: int = 240,
+    preferred_tangent_offset: int | None = None,
     ignore_names: set[str] | None = None,
     component_padding: int = 10,
 ) -> PortAttachmentPlacement:
@@ -464,6 +541,9 @@ def place_attached_component(
     blocked = _component_blockers(circuit, project=project, grid=step, padding=component_padding)
     blocked.update(_wire_points(circuit, grid=step))
     blocked.discard(port_point)
+    protected_ports = _port_clearance_points(anchor, geometry, grid=step, skip_port_name=port_name)
+    blocked.update(protected_ports)
+    blocked.discard(port_point)
 
     def loc_for_attachment_point(attach_point: Point) -> Point:
         return (attach_point[0] - attached_offset[0], attach_point[1] - attached_offset[1])
@@ -480,7 +560,7 @@ def place_attached_component(
             port_point[0] + side[0] * lead_distance,
             port_point[1] + side[1] * lead_distance,
         )
-        for tangent_offset in _candidate_offsets(step, tangent_limit):
+        for tangent_offset in _preferred_candidate_offsets(step, tangent_limit, preferred_tangent_offset):
             attach_point = (
                 lead_point[0] + tangent[0] * tangent_offset,
                 lead_point[1] + tangent[1] * tangent_offset,
@@ -499,7 +579,7 @@ def place_attached_component(
                     facing=facing,
                     path=path,
                 )
-            if len(fallback_candidates) < 8:
+            if len(fallback_candidates) < 64:
                 fallback_candidates.append((lead_point, attach_point, loc))
 
     for lead_point, attach_point, loc in fallback_candidates:
@@ -511,6 +591,7 @@ def place_attached_component(
             component_padding=component_padding,
             grid=step,
             margin=120,
+            extra_blocked=protected_ports,
         )
         if path is None:
             continue
@@ -522,21 +603,38 @@ def place_attached_component(
             path=path,
         )
 
-    fallback_loc = (
+    fallback_lead_point = (
         port_point[0] + side[0] * distance,
         port_point[1] + side[1] * distance,
     )
+    fallback_offset = _snap(preferred_tangent_offset or 0, step)
     fallback_attach_point = (
-        fallback_loc[0] + attached_offset[0],
-        fallback_loc[1] + attached_offset[1],
+        fallback_lead_point[0] + tangent[0] * fallback_offset,
+        fallback_lead_point[1] + tangent[1] * fallback_offset,
     )
-    return PortAttachmentPlacement(
-        port_point=port_point,
-        lead_point=fallback_attach_point,
-        loc=fallback_loc,
-        facing=facing,
-        path=_compact_points([port_point, fallback_attach_point]),
-    )
+    fallback_loc = loc_for_attachment_point(fallback_attach_point)
+    fallback_candidate = make_candidate(fallback_loc)
+    fallback_bounds = component_bounds(fallback_candidate, project=project)
+    if not any(_bounds_overlap(fallback_bounds, component_bounds(other, project=project)) for other in existing):
+        fallback_path = route_circuit_path(
+            circuit,
+            port_point,
+            fallback_attach_point,
+            project=project,
+            component_padding=component_padding,
+            grid=step,
+            margin=160,
+            extra_blocked=protected_ports,
+        )
+        if fallback_path is not None:
+            return PortAttachmentPlacement(
+                port_point=port_point,
+                lead_point=fallback_lead_point,
+                loc=fallback_loc,
+                facing=facing,
+                path=fallback_path,
+            )
+    raise RuntimeError(f"unable to place {attached.name} on {anchor.name}.{port_name} without crossing existing wiring")
 
 
 def find_component_overlaps(

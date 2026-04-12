@@ -43,6 +43,17 @@ def _wire_touches_points(wire: RawWire, points: set[tuple[int, int]]) -> bool:
     return tuple(wire.start) in points or tuple(wire.end) in points
 
 
+def _wire_contains_point(wire: RawWire, point: tuple[int, int]) -> bool:
+    x, y = point
+    x0, y0 = wire.start
+    x1, y1 = wire.end
+    if x0 == x1 == x:
+        return min(y0, y1) <= y <= max(y0, y1)
+    if y0 == y1 == y:
+        return min(x0, x1) <= x <= max(x0, x1)
+    return False
+
+
 @dataclass(slots=True)
 class CircuitEditor:
     project: RawProject | None
@@ -204,6 +215,8 @@ class CircuitEditor:
         self.circuit.components = [
             component for component in self.circuit.components if id(component) not in target_ids
         ]
+        if prune_wires:
+            self.cleanup_detached_artifacts()
         return len(targets)
 
     def remove_selected(self, *keys: str, source: SelectorSource = "current", prune_wires: bool = True) -> int:
@@ -244,6 +257,69 @@ class CircuitEditor:
 
     def normalize_padding(self, *, padding: int = 20, grid: int = 10) -> tuple[int, int]:
         return normalize_circuit_to_padding(self.circuit, project=self.project, padding=padding, grid=grid)
+
+    def cleanup_detached_artifacts(self) -> dict[str, int]:
+        removed_tunnels = 0
+        removed_wires = 0
+        while True:
+            tunnels_now = self._remove_orphan_tunnels()
+            wires_now = self._prune_dead_wire_leaves()
+            removed_tunnels += tunnels_now
+            removed_wires += wires_now
+            if tunnels_now == 0 and wires_now == 0:
+                break
+        return {"tunnels": removed_tunnels, "wires": removed_wires}
+
+    def _remove_orphan_tunnels(self) -> int:
+        point_to_components: dict[tuple[int, int], list[RawComponent]] = {}
+        for component in self.circuit.components:
+            if component.name == "Tunnel":
+                continue
+            for point in _component_connection_points(component, project=self.project):
+                point_to_components.setdefault(point, []).append(component)
+
+        kept: list[RawComponent] = []
+        removed = 0
+        for component in self.circuit.components:
+            if component.name != "Tunnel":
+                kept.append(component)
+                continue
+            point = tuple(component.loc)
+            attached_to_component = bool(point_to_components.get(point))
+            attached_to_wire = any(_wire_contains_point(wire, point) for wire in self.circuit.wires)
+            if attached_to_component or attached_to_wire:
+                kept.append(component)
+                continue
+            removed += 1
+        if removed:
+            self.circuit.components = kept
+        return removed
+
+    def _prune_dead_wire_leaves(self) -> int:
+        removed_total = 0
+        while True:
+            anchors: set[tuple[int, int]] = set()
+            for component in self.circuit.components:
+                anchors.update(_component_connection_points(component, project=self.project))
+
+            degree: Counter[tuple[int, int]] = Counter()
+            for wire in self.circuit.wires:
+                degree[tuple(wire.start)] += 1
+                degree[tuple(wire.end)] += 1
+
+            kept: list[RawWire] = []
+            removed_now = 0
+            for wire in self.circuit.wires:
+                start = tuple(wire.start)
+                end = tuple(wire.end)
+                if (start not in anchors and degree[start] <= 1) or (end not in anchors and degree[end] <= 1):
+                    removed_now += 1
+                    continue
+                kept.append(wire)
+            if removed_now == 0:
+                return removed_total
+            removed_total += removed_now
+            self.circuit.wires = kept
 
 
 @dataclass(slots=True)

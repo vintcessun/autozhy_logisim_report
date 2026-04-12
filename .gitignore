@@ -17,3 +17,6 @@ wheels/
 
 # Model Temp Files
 /scratch
+
+# Test Files
+/.pytest_cache
