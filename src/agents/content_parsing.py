@@ -187,6 +187,7 @@ class ContentParsingAgent:
                 task_name=task_item.get("task_name", "未命名任务"),
                 task_type=task_item.get("task_type", "verification"),
                 analysis_raw=task_item.get("description", ""),
+                target_subcircuit=task_item.get("target_subcircuit"),
                 experiment_objective=objective,
                 experiment_environment=environment,
                 thinking_questions=thinking_qs

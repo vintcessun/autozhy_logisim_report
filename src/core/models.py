@@ -14,6 +14,7 @@ class TaskRecord(BaseModel):
     status: Literal["pending", "executing", "finished", "failed"] = "pending"
     assets: List[str] = []       # 关联的截图路径 (相对于 .assets/)
     analysis_raw: str = ""       # 原始分析文本
+    target_subcircuit: Optional[str] = None  # 明确指定的目标子电路名
     logic_check_pass: bool = False  # 拓扑可达性状态
     
     # 扩展字段：实验目的与环境

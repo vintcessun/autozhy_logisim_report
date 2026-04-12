@@ -33,7 +33,9 @@ class DesignAgent:
         try:
             if template_path and template_path.exists():
                 proj = load_project(str(template_path))
-                circ = proj.main_circuit or proj.circuits[0]
+                # 兼容 RawProject 的属性访问
+                main_name = proj.main.name if proj.main else proj.circuits[0].name
+                circ = proj.circuit(main_name)
                 analysis = f"当前电路组件数: {len(circ.components)}\n逻辑拓扑：{extract_logical_circuit(circ, project=proj)}"
             else:
                 analysis = "从空电路开始设计"
@@ -42,14 +44,19 @@ class DesignAgent:
                 template_path.parent.mkdir(parents=True, exist_ok=True)
                 if not template_path.exists():
                     from logisim_logic import RawProject, RawCircuit, RawMain, save_project
-                    empty_proj = RawProject(circuits=[RawCircuit(name="main")], main=RawMain(name="main"))
+                    empty_proj = RawProject(
+                        root_attrs={"source": "5.0", "version": "1.0"},
+                        root_text="",
+                        circuits=[RawCircuit(name="main")], 
+                        main=RawMain(name="main")
+                    )
                     save_project(empty_proj, template_path)
         except Exception as e:
             analysis = f"解析电路上下文失败: {e}"
 
         # 2. Pro 阶段：制定架构策略
         self._log("\n" + "="*50 + "\n[Pro] 正在制定设计策略与架构分解...\n" + "="*50)
-        design_spec = await self._generate_strategy(task.task_name, task.analysis_raw, analysis)
+        design_spec = await self._generate_strategy(task.task_name, task.analysis_raw, analysis, task.target_subcircuit)
         self._log(f"[Pro] 策略生成完毕：\n{design_spec}\n")
 
         # 3. Flash 阶段：执行代码实现与内部自愈闭环
@@ -82,10 +89,15 @@ class DesignAgent:
             content = content.replace(f"{{{k}}}", str(v))
         return content
 
-    async def _generate_strategy(self, task_name: str, goal: str, context: str) -> str:
+    async def _generate_strategy(self, task_name: str, goal: str, context: str, target_subcircuit: str = None) -> str:
         """Pro 决策逻辑"""
         prompt_path = self.prompt_dir / "design" / "strategy.txt"
-        prompt = self._load_prompt(prompt_path, goal=goal, context=context)
+        
+        # 增强目标子电路上下文
+        target_info = f"\n任务明确要求修改的子电路名称为: {target_subcircuit}" if target_subcircuit else ""
+        full_goal = f"{goal}{target_info}"
+        
+        prompt = self._load_prompt(prompt_path, goal=full_goal, context=context)
         
         config = types.GenerateContentConfig(
             tools=tools_list,
@@ -166,13 +178,34 @@ class DesignAgent:
         """物理执行 Logic Logic 脚本 (兼容新版 ProjectFacade 流程)"""
         try:
             import logisim_logic
-            from logisim_logic import ProjectFacade
+            from logisim_logic import ProjectFacade, component
+            from logisim_logic.rebuild_support import (
+                add_component, add_tunnel, add_tunnel_to_port, add_tunnel_on_port,
+                connect_points_routed, connect_ports_routed
+            )
             
+            def normalize_project_source(path):
+                import re
+                p = Path(path)
+                text = p.read_text(encoding="utf-8")
+                updated = re.sub(r'(<project\s+source=")([^"]+?)(")', r"\g<1>2.15.0\3", text, count=1)
+                if updated != text:
+                    p.write_text(updated, encoding="utf-8")
+
             exec_globals = {
                 "logisim_logic": logisim_logic, 
                 "ProjectFacade": ProjectFacade,
+                "component": component,
+                "add_component": add_component,
+                "add_tunnel": add_tunnel,
+                "add_tunnel_to_port": add_tunnel_to_port,
+                "add_tunnel_on_port": add_tunnel_on_port,
+                "connect_points_routed": connect_points_routed,
+                "connect_ports_routed": connect_ports_routed,
                 "template_path": str(template_path),
                 "out_path": str(out_path),
+                "normalize_project_source": normalize_project_source,
+                "Path": Path,
                 "__builtins__": __builtins__
             }
             exec_locals = {}

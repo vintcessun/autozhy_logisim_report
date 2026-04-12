@@ -6,6 +6,7 @@ from google import genai
 # 统一注入项目根目录和 src 目录
 project_root = Path(__file__).parents[1]
 sys.path.append(str(project_root))
+sys.path.append(str(project_root / "src"))
 
 from src.utils.config_loader import ConfigManager
 from src.agents.design_agent import DesignAgent
@@ -36,14 +37,26 @@ async def run_smoketest():
         task_id="smoketest_001",
         task_name="极简AND门设计",
         task_type="design",
-        analysis_raw="目标：设计一个 AND 门，将输入 A 和 B 连接到一个输出 OUT。"
+        analysis_raw="目标：设计一个 AND 门，将输入 A 和 B 连接到一个输出 OUT。",
+        target_subcircuit="main"
     )
     
     print("\n--- [SMOKETEST] Starting Minimal Design Task ---")
     
-    # 运行设计 (从空图开始)
-    updated_task = await agent.run(task, None) 
-    
+    # 运行设计 (增量模式：先创建一个空模板)
+    template_path = project_root / "tests" / "cases" / "smoketest" / "smoketest_template.circ"
+    template_path.parent.mkdir(parents=True, exist_ok=True)
+    if not template_path.exists():
+        from logisim_logic import RawProject, RawCircuit, RawMain, save_project
+        empty_proj = RawProject(
+            root_attrs={"source": "5.0", "version": "1.0"},
+            root_text="",
+            circuits=[RawCircuit(name="main")], 
+            main=RawMain(name="main")
+        )
+        save_project(empty_proj, template_path)
+        
+    updated_task = await agent.run(task, template_path)    
     if updated_task.status == "finished":
         result_file = Path(updated_task.source_circ[0])
         print(f"Smoketest Success! File: {result_file}")

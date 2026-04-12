@@ -10,8 +10,8 @@
 
 | **测试脚本** | **验证目标** | **运行方式** |
 | :--- | :--- | :--- |
-| `tests/test_simulator_test1.py` | 验证 16 位加法器在 Headless 模式下的正确性。 | `pytest tests/test_simulator_test1.py` |
-| `tests/test_simulator_test2.py` | 验证 8 位乘法器（带时钟脉冲注入）的自动化验证流程。 | `pytest tests/test_simulator_test2.py` |
+| `tests/test_simulator_test1.py` | 验证 16 位加法器在 Headless 模式下的正确性。 | `uv run pytest tests/test_simulator_test1.py` |
+| `tests/test_simulator_test2.py` | 验证 8 位乘法器（带时钟脉冲注入）的自动化验证流程。 | `uv run pytest tests/test_simulator_test2.py` |
 
 ## 3. 设计智能体测试 (Design Agent Tests)
 
@@ -21,13 +21,13 @@
 - **脚本**：`tests/test_design_smoketest.py`
 - **内容**：设计一个极简的 AND 门电路。
 - **目的**：打通从 API 请求、物理构建到文件保存的最小全路径。
-- **运行**：`python tests/test_design_smoketest.py`
+- **运行**：`uv run python tests/test_design_smoketest.py`
 
 ### 3.2 集成逻辑测试 (Integration Logic Test)
 - **脚本**：`tests/test_design_integration_logic.py`
 - **内容**：要求 Agent 设计一个 16 位先行进位加法器 (CLA)。
 - **目的**：验证 Agent 在复杂电路设计中的稳定性，并通过与 Oracle 电路（预期结果）进行黑盒对撞校验。
-- **运行**：`pytest tests/test_design_integration_logic.py`
+- **运行**：`uv run pytest tests/test_design_integration_logic.py`
 
 ## 4. 调试建议
 
