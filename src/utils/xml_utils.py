@@ -1,64 +1,54 @@
-import xml.etree.ElementTree as ET
+import sys
 from pathlib import Path
-from typing import Set, Tuple, List
+from typing import Tuple, List
+import logisim_logic
 
 class CircuitLinter:
-    """静态电路校验器，执行规格书要求的 Actor-Critic 闭环校验"""
+    """利用 logisim_logic 引擎进行高级电路校验"""
 
     def __init__(self, circ_path: Path):
         self.circ_path = circ_path
-        self.tree: ET.ElementTree = ET.parse(circ_path)
-        self.root = self.tree.getroot()
 
     def validate_topology(self) -> Tuple[bool, List[str]]:
         """
-        验证逻辑拓扑可达性。
-        规则：每一条 <wire> 的 from 和 to 必须连接在某个组件或另一条线的端点上。
+        验证电路的逻辑一致性。
+        利用库的逻辑提取能力，如果电路存在致命结构错误（如非法连接），库会抛出异常。
         """
         errors = []
-        valid_points: Set[Tuple[int, int]] = self._collect_connection_points()
-        
-        # 扫描所有 wire
-        for circuit in self.root.findall(".//circuit"):
-            for wire in circuit.findall("wire"):
-                f = self._parse_coord(wire.get("from"))
-                t = self._parse_coord(wire.get("to"))
-                
-                if f not in valid_points:
-                    errors.append(f"悬空连线起点: {f} 在电路 {circuit.get('name')} 中")
-                if t not in valid_points:
-                    errors.append(f"悬空连线终点: {t} 在电路 {circuit.get('name')} 中")
-                
-                # 线本身也提供连接点
-                valid_points.add(f)
-                valid_points.add(t)
-
-        return len(errors) == 0, errors
-
-    def _collect_connection_points(self) -> Set[Tuple[int, int]]:
-        """收集所有组件的物理连接点"""
-        points = set()
-        for circuit in self.root.findall(".//circuit"):
-            # 记录所有组件的 loc
-            for comp in circuit.findall("comp"):
-                loc = self._parse_coord(comp.get("loc"))
-                if loc:
-                    points.add(loc)
-        return points
-
-    def _parse_coord(self, coord_str: str) -> Tuple[int, int]:
-        """解析 '(x,y)' 格式的坐标"""
-        if not coord_str:
-            return None
         try:
-            # 去掉括号并拆分
-            cleaned = coord_str.strip("()")
-            x, y = map(int, cleaned.split(","))
-            return (x, y)
-        except Exception:
-            return None
+            proj = logisim_logic.load_project(self.circ_path)
+            for circuit in proj.circuits:
+                # 尝试提取逻辑网络，这会自动检查连线有效性
+                logisim_logic.extract_logical_circuit(circuit, project=proj)
+            return True, []
+        except Exception as e:
+            errors.append(f"逻辑校验失败: {str(e)}")
+            return False, errors
 
     def fix_xml_formatting(self):
-        """格式化并清理 XML"""
-        ET.indent(self.tree, space="  ", level=0)
-        self.tree.write(self.circ_path, encoding="utf-8", xml_declaration=True)
+        """利用库的 save_project 自带的格式化功能"""
+        try:
+            proj = logisim_logic.load_project(self.circ_path)
+            logisim_logic.save_project(proj, self.circ_path)
+        except Exception:
+            pass
+
+class CircuitAnalyzer:
+    """电路结构语义分析器"""
+    
+    def __init__(self, circ_path: Path):
+        self.circ_path = circ_path
+
+    def get_structure_summary(self) -> str:
+        """获取高度语义化的电路连接摘要"""
+        try:
+            proj = logisim_logic.load_project(self.circ_path)
+            summary = []
+            for circuit in proj.circuits:
+                logical = logisim_logic.extract_logical_circuit(circuit, project=proj)
+                summary.append(f"电路 '{circuit.name}' 逻辑快照:")
+                # 利用库的 __str__ 方法输出格式化的网络结构
+                summary.append(str(logical))
+            return "\n".join(summary)
+        except Exception as e:
+            return f"电路分析失败: {e}"

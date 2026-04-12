@@ -5,7 +5,7 @@ import patoolib
 import pdfplumber
 from docx import Document
 from typing import List
-import google.generativeai as genai
+from google import genai
 from ..core.models import TaskRecord
 
 class DataDecompressor:
@@ -58,35 +58,46 @@ class DataDecompressor:
 class RequirementExtractor:
     """需求提取器，利用 pdfplumber 和 python-docx"""
     
-    def __init__(self, gemini_model):
-        self.model = gemini_model
+    def __init__(self, client, model_name: str):
+        self.client = client
+        self.model_id = model_name
 
     def extract_text_from_pdf(self, pdf_path: Path) -> str:
         """提取 PDF 文本"""
         text = ""
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ""
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    text += page.extract_text() or ""
+        except Exception as e:
+            print(f"警告: 无法从 PDF {pdf_path.name} 提取文本: {e}")
         return text
 
     def extract_text_from_docx(self, docx_path: Path) -> str:
         """提取 DOCX 文本"""
-        doc = Document(docx_path)
-        return "\n".join([para.text for para in doc.paragraphs])
+        try:
+            doc = Document(docx_path)
+            return "\n".join([para.text for para in doc.paragraphs])
+        except Exception as e:
+            print(f"警告: 无法从 DOCX {docx_path.name} 提取文本: {e}")
+            return ""
 
     async def parse_tasks_with_llm(self, text: str, prompt_template: str) -> List[dict]:
         """利用 Gemini 3 Flash 将文本转化为结构化任务清单"""
-        if not self.model:
+        if not self.client:
             return {}
 
         prompt = f"{prompt_template}\n\n待解析文本：\n{text}"
         
-        # 使用 Gemini 3 Flash 进行生成
-        response = await self.model.generate_content_async(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-            )
+        # 使用现代 SDK 语法与重试机制
+        from ..utils.ai_utils import retry_llm_call
+        response = await retry_llm_call(
+            self.client.models.generate_content,
+            model=self.model_id,
+            contents=prompt,
+            config={
+                'response_mime_type': 'application/json',
+            }
         )
         
         import json
@@ -118,10 +129,10 @@ class CircAssociator:
 class ContentParsingAgent:
     """内容解析智能体总控"""
     
-    def __init__(self, config, workspace_dir: Path):
+    def __init__(self, config, workspace_dir: Path, client):
         self.decompressor = DataDecompressor(workspace_dir)
-        # 初始化 Gemini 模型 (后续通过 Config 传入)
-        self.extractor = RequirementExtractor(None)
+        # 初始化现代版需求提取器
+        self.extractor = RequirementExtractor(client, config.gemini.model_flash)
         self.associator = CircAssociator()
 
     async def run(self, input_dir: Path) -> List[TaskRecord]:
@@ -139,7 +150,7 @@ class ContentParsingAgent:
         for item in input_dir.iterdir():
             if self.decompressor._is_archive(item):
                 self.decompressor.unzip_recursive(item)
-            elif item.suffix == '.circ':
+            elif item.suffix.lower() in ('.circ', '.pdf', '.docx'):
                 shutil.copy(item, self.decompressor.workspace_dir / item.name)
         
         # 2. 在平铺后的工作区中寻找指导书 (.pdf, .docx)

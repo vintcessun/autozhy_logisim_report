@@ -1,7 +1,7 @@
 import asyncio
 import ctypes
 from pathlib import Path
-import google.generativeai as genai
+from google import genai
 
 from src.utils.config_loader import ConfigManager
 from src.agents.content_parsing import ContentParsingAgent
@@ -9,8 +9,15 @@ from src.agents.design_agent import DesignAgent
 from src.agents.verification_agent import VerificationAgent
 from src.agents.report_agent import ReportAgent
 
+import sys
+
 def initialize_system():
     """初始化系统环境"""
+    # 注入 vendor 路径，使得 logisim_logic 库全局可用
+    vendor_path = str(Path(__file__).parent / "src" / "vendor")
+    if vendor_path not in sys.path:
+        sys.path.append(vendor_path)
+    
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception as e:
@@ -25,21 +32,28 @@ async def main():
         return
     app_config = ConfigManager.load_config(config_path)
     
-    # 2. 配置模型
-    genai.configure(api_key=app_config.gemini.api_key, transport="rest")
-    model_pro = genai.GenerativeModel(app_config.gemini.model_pro)
-    model_flash = genai.GenerativeModel(app_config.gemini.model_flash)
+    # 2. 配置现代 SDK 客户端
+    # 自动清洗 base_url 中的版本后缀，以便新 SDK 正确处理
+    endpoint = app_config.gemini.base_url.rstrip('/')
+    if endpoint.endswith('/v1beta'):
+        endpoint = endpoint[:-7]
+    elif endpoint.endswith('/v1'):
+        endpoint = endpoint[:-3]
+    
+    client = genai.Client(
+        api_key=app_config.gemini.api_key,
+        http_options={'base_url': endpoint}
+    )
 
-    # 3. 初始化所有智能体
+    # 3. 初始化并注入客户端到智能体
     workspace_dir = Path("workspace")
     input_dir = Path("data_in")
     
-    parsing_agent = ContentParsingAgent(app_config, workspace_dir)
-    parsing_agent.extractor.model = model_flash
-    
-    design_agent = DesignAgent(model_pro)
-    verification_agent = VerificationAgent(app_config)
-    report_agent = ReportAgent(model_flash)
+    # 全部通过注入 client 和具体型号名来解耦
+    parsing_agent = ContentParsingAgent(app_config, workspace_dir, client)
+    design_agent = DesignAgent(client, app_config.gemini.model_pro)
+    verification_agent = VerificationAgent(app_config, client)
+    report_agent = ReportAgent(client, app_config.gemini.model_flash)
 
     print("--- [1] 启动内容解析 ---")
     tasks = await parsing_agent.run(input_dir)

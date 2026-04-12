@@ -1,13 +1,20 @@
 import pytest
+import sys
 from unittest.mock import MagicMock, AsyncMock
 from pathlib import Path
 
+# 全局注入 vendor 路径，确保测试环境能引用 logisim_logic
+vendor_path = str(Path(__file__).parents[1] / "src" / "vendor")
+if vendor_path not in sys.path:
+    sys.path.append(vendor_path)
+
 @pytest.fixture
-def mock_gemini_model():
-    """Mock Gemini 模型对象"""
-    model = MagicMock()
-    model.generate_content_async = AsyncMock()
-    return model
+def mock_genai_client():
+    """Mock 现代化的 genai.Client 对象"""
+    client = MagicMock()
+    # 模拟 client.models.generate_content 链路
+    client.models.generate_content = MagicMock()
+    return client
 
 @pytest.fixture
 def sample_circ_xml():

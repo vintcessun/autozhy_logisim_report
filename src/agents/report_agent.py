@@ -2,7 +2,7 @@ import asyncio
 from pathlib import Path
 from typing import List
 from ..core.models import TaskRecord
-import google.generativeai as genai
+from google import genai
 
 class ReportAgent:
     """
@@ -10,8 +10,9 @@ class ReportAgent:
     职责：统筹全局流程，组合并润色最终报告。
     """
 
-    def __init__(self, model):
-        self.model = model
+    def __init__(self, client, model_id: str):
+        self.client = client
+        self.model_id = model_id
 
     async def orchestrate(self, tasks: List[TaskRecord], output_path: Path) -> Path:
         """全局调度并生成最终报告"""
@@ -65,10 +66,22 @@ class ReportAgent:
         prompt = prompt.replace("{{raw_analysis}}", task.analysis_raw)
         prompt = prompt.replace("{{image_path}}", img_path)
         
-        response = await self.model.generate_content_async(prompt)
+        # 使用现代 SDK 语法与重试机制
+        from ..utils.ai_utils import retry_llm_call
+        response = await retry_llm_call(
+            self.client.models.generate_content,
+            model=self.model_id,
+            contents=prompt
+        )
         return response.text.strip()
+
     async def _answer_thinking_question(self, question: str, context: str) -> str:
         """模型基于实验上下文回答思考题"""
         prompt = f"依据以下实验背景资料，回答思考题：\n\n【背景】\n{context[:2000]}\n\n【问题】\n{question}"
-        response = await self.model.generate_content_async(prompt)
+        from ..utils.ai_utils import retry_llm_call
+        response = await retry_llm_call(
+            self.client.models.generate_content,
+            model=self.model_id,
+            contents=prompt
+        )
         return response.text.strip()

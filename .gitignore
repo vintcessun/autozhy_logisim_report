@@ -11,3 +11,9 @@ wheels/
 
 # Debug files
 /debug
+
+# Config files
+/config/config.toml
+
+# Model Temp Files
+/scratch
