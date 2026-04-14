@@ -10,12 +10,14 @@ from .model import RawCircuit, RawComponent, RawProject, RawWire
 from .project_tools import clone_project, remove_circuit, rename_circuit, replace_circuit, set_main
 from .rebuild_support import (
     add_polyline,
+    canonicalize_wires,
     clone_circuit,
     find_component,
     get_attr,
     normalize_circuit_to_padding,
     normalize_project_root_circuits_to_padding,
     preserve_base_appearance,
+    remove_floating_wire_islands,
     replace_text_exact,
     update_text_contains,
 )
@@ -56,10 +58,18 @@ def _wire_contains_point(wire: RawWire, point: tuple[int, int]) -> bool:
 
 @dataclass(slots=True)
 class CircuitEditor:
-    project: RawProject | None
-    base_circuit: RawCircuit
+    project_facade: ProjectFacade | None
     circuit: RawCircuit
+    base_circuit: RawCircuit | None = None
     selectors: dict[str, ComponentSelector] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.base_circuit is None:
+            self.base_circuit = self.circuit
+
+    @property
+    def project(self) -> RawProject | None:
+        return self.project_facade.project if self.project_facade else None
 
     @property
     def template(self) -> CircuitTemplate:
@@ -82,9 +92,9 @@ class CircuitEditor:
 
     def component_at(
         self,
+        loc: tuple[int, int],
         *,
         kind: str | None = None,
-        loc: tuple[int, int],
         source: SelectorSource = "current",
     ) -> RawComponent:
         circuit = self.base_circuit if source == "base" else self.circuit
@@ -258,6 +268,51 @@ class CircuitEditor:
     def normalize_padding(self, *, padding: int = 20, grid: int = 10) -> tuple[int, int]:
         return normalize_circuit_to_padding(self.circuit, project=self.project, padding=padding, grid=grid)
 
+    def clear_wires(self) -> int:
+        count = len(self.circuit.wires)
+        self.circuit.wires = []
+        return count
+
+    def get_nets(self) -> list[Any]:
+        from .graph import build_wire_graph
+        graph = build_wire_graph(self.circuit)
+        return list(graph.nets.values())
+
+    def all_components(self) -> list[RawComponent]:
+        return list(self.circuit.components)
+
+    def get_component(self, key: str, *, source: SelectorSource = "current") -> RawComponent:
+        return self.component(key, source=source)
+
+    def set_attribute(self, key: str, name: str, value: Any) -> RawComponent:
+        return self.set_attrs(key, **{name: value})
+
+    # --- AGENT CONVENIENCE METHODS ---
+    def add_component(self, name: str, loc: tuple[int, int], attrs: dict[str, str] | None = None, lib: str | None = None) -> RawComponent:
+        from .rebuild_support import add_component
+        return add_component(self.circuit, name, loc, attrs or {}, lib=lib)
+
+    def add_wire(self, start: tuple[int, int], end: tuple[int, int]) -> RawWire:
+        wire = RawWire(start=start, end=end)
+        self.circuit.wires.append(wire)
+        return wire
+
+    def delete_component(self, component: RawComponent) -> int:
+        """删除单个组件。"""
+        return self.remove_components([component])
+
+    def port_location(self, ref: str | RawComponent, port_name: str) -> tuple[int, int]:
+        """获取端口坐标。"""
+        return self.port_point(ref, port_name)
+
+    def save(self, path: str | Path | None = None) -> Path:
+        if self.project_facade is None:
+             raise ValueError("Cannot save from CircuitEditor without project context")
+        return self.project_facade.save(path)
+
+    def cleanup(self) -> dict[str, int]:
+        return self.cleanup_detached_artifacts()
+
     def cleanup_detached_artifacts(self) -> dict[str, int]:
         removed_tunnels = 0
         removed_wires = 0
@@ -268,7 +323,15 @@ class CircuitEditor:
             removed_wires += wires_now
             if tunnels_now == 0 and wires_now == 0:
                 break
-        return {"tunnels": removed_tunnels, "wires": removed_wires}
+        
+        self.circuit.wires = canonicalize_wires(self.circuit.wires)
+        removed_islands = remove_floating_wire_islands(self.circuit, project=self.project)
+        
+        return {
+            "tunnels": removed_tunnels, 
+            "wires": removed_wires,
+            "islands": removed_islands
+        }
 
     def _remove_orphan_tunnels(self) -> int:
         point_to_components: dict[tuple[int, int], list[RawComponent]] = {}
@@ -346,8 +409,14 @@ class ProjectFacade:
     def circuit_names(self) -> list[str]:
         return [circuit.name for circuit in self.project.circuits]
 
+    def get_circuit_names(self) -> list[str]:
+        return self.circuit_names()
+
     def circuit(self, name: str) -> RawCircuit:
         return self.project.circuit(name)
+
+    def get_circuit(self, name: str) -> RawCircuit:
+        return self.circuit(name)
 
     def rename_circuit(self, old_name: str, new_name: str) -> None:
         rename_circuit(self.project, old_name, new_name)
@@ -361,6 +430,11 @@ class ProjectFacade:
     def set_main(self, name: str) -> None:
         set_main(self.project, name)
 
+    def add_circuit(self, name: str) -> CircuitEditor:
+        new_circ = RawCircuit(name=name)
+        replace_circuit(self.project, new_circ)
+        return self.edit_circuit(name)
+
     def edit_circuit(
         self,
         name: str,
@@ -369,7 +443,7 @@ class ProjectFacade:
         base_name: str | None = None,
     ) -> CircuitEditor:
         return CircuitEditor(
-            project=self.project,
+            project_facade=self,
             base_circuit=self.circuit(base_name or name),
             circuit=self.circuit(name),
             selectors=dict(selectors or {}),
@@ -389,7 +463,7 @@ class ProjectFacade:
         if set_as_main:
             set_main(self.project, new_name)
         return CircuitEditor(
-            project=self.project,
+            project_facade=self,
             base_circuit=source,
             circuit=copied,
             selectors=dict(selectors or {}),
@@ -408,7 +482,7 @@ class ProjectFacade:
         imported = clone_circuit(source, name=as_name or source_name)
         replace_circuit(self.project, imported)
         return CircuitEditor(
-            project=self.project,
+            project_facade=self,
             base_circuit=source,
             circuit=imported,
             selectors=dict(selectors or {}),

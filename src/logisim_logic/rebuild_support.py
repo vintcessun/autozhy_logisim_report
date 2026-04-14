@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable
 from copy import deepcopy
 from itertools import count
@@ -610,6 +610,14 @@ def attrs_dict(comp: RawComponent) -> dict[str, str]:
 
 def set_attr(comp: RawComponent, name: str, value: str, *, as_text: bool | None = None) -> None:
     comp.set(name, value, as_text=as_text)
+def set_attributes(comp: RawComponent, attrs: dict[str, str]) -> None:
+    for name, value in attrs.items():
+        comp.set(name, value)
+
+
+get_attribute = get_attr
+set_attribute = set_attr
+
 
 
 def find_component(circuit: RawCircuit, *, name: str | None = None, loc: tuple[int, int] | None = None) -> RawComponent:
@@ -619,7 +627,18 @@ def find_component(circuit: RawCircuit, *, name: str | None = None, loc: tuple[i
         if loc is not None and comp.loc != loc:
             continue
         return comp
-    raise KeyError((name, loc))
+    
+    # 查找失败，构建详细的 Inventory 反馈
+    inventory = []
+    for c in circuit.components:
+        inventory.append(f"{c.name} at {c.loc}")
+    
+    query = f"name='{name}'" if name else ""
+    if loc:
+        query += f" loc={loc}"
+    
+    raise KeyError(f"Could not find component with {query} in circuit '{circuit.name}'. "
+                   f"Available components: {', '.join(inventory)}")
 
 
 def find_tunnel(circuit: RawCircuit, label: str, loc: tuple[int, int] | None = None) -> RawComponent:
@@ -1328,7 +1347,7 @@ def connect_ports_routed(
     lead_distance: int = 30,
     margin: int = 160,
     component_padding: int = 10,
-    avoid_wires: bool = False,
+    avoid_wires: bool = True,
 ) -> list[RawWire]:
     src_point = component_port_point(src_component, src_port, project=project)
     dst_point = component_port_point(dst_component, dst_port, project=project)
@@ -2776,3 +2795,171 @@ def rename_tunnel_labels(circuit: RawCircuit, old: str, new: str) -> None:
     for comp in circuit.components:
         if comp.name == "Tunnel" and get_attr(comp, "label") == old:
             set_attr(comp, "label", new)
+
+
+def add_splitter(
+    circuit: RawCircuit,
+    loc: tuple[int, int],
+    *,
+    facing: str,
+    incoming: int,
+    groups: list[int],
+    appear: str = "center",
+) -> RawComponent:
+    attrs = {
+        "facing": facing,
+        "fanout": str(len(set(groups))),
+        "incoming": str(incoming),
+        "appear": appear,
+    }
+    for i, g in enumerate(groups):
+        attrs[f"bit{i}"] = str(g)
+    return add_component(circuit, "Splitter", loc, attrs, lib="0")
+
+
+def add_splitter(
+    circuit: RawCircuit,
+    loc: tuple[int, int],
+    *,
+    facing: str,
+    incoming: int,
+    groups: list[int],
+    appear: str = "center",
+) -> RawComponent:
+    attrs = {
+        "facing": facing,
+        "fanout": str(len(set(groups))),
+        "incoming": str(incoming),
+        "appear": appear,
+    }
+    for i, g in enumerate(groups):
+        attrs[f"bit{i}"] = str(g)
+    return add_component(circuit, "Splitter", loc, attrs, lib="0")
+
+
+def canonicalize_wires(wires: list[RawWire]) -> list[RawWire]:
+    """去掉重复、零长度导线，并合并共线的重叠/相邻导线。"""
+    if not wires:
+        return []
+
+    # 1. 过滤零长度
+    active = [wire for wire in wires if wire.start != wire.end]
+    if not active:
+        return []
+
+    # 2. 标准化方向 (确保 start < end)
+    normalized: list[tuple[tuple[int, int], tuple[int, int], str]] = []
+    for wire in active:
+        s, e = wire.start, wire.end
+        if s > e:
+            s, e = e, s
+        orientation = "h" if s[1] == e[1] else "v"
+        normalized.append((s, e, orientation))
+
+    # 3. 按方向和固定轴分组
+    h_groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    v_groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    
+    for s, e, orient in normalized:
+        if orient == "h":
+            h_groups[s[1]].append((s[0], e[0]))
+        else:
+            v_groups[s[0]].append((s[1], e[1]))
+
+    def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        if not intervals:
+            return []
+        intervals.sort()
+        merged = [intervals[0]]
+        for start, end in intervals[1:]:
+            prev_start, prev_end = merged[-1]
+            if start <= prev_end:  # 重叠或相邻
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    result: list[RawWire] = []
+    for y, intervals in h_groups.items():
+        for start_x, end_x in merge_intervals(intervals):
+            result.append(RawWire(start=(start_x, y), end=(end_x, y)))
+    
+    for x, intervals in v_groups.items():
+        for start_y, end_y in merge_intervals(intervals):
+            result.append(RawWire(start=(x, start_y), end=(x, end_y)))
+
+    return result
+
+
+def remove_floating_wire_islands(circuit: RawCircuit, project: RawProject | None = None) -> int:
+    """删除那些不接触任何组件锚点（包括 Pin, Tunnel 等）的导线闭合网络。"""
+    if not circuit.wires:
+        return 0
+
+    # 1. 获取所有组件的锚点
+    all_anchors: set[tuple[int, int]] = set()
+    for component in circuit.components:
+        all_anchors.update(_component_connection_points(component, project=project))
+
+    # 2. 构建导线图 (Point -> Neighbors)
+    adj: dict[tuple[int, int], set[tuple[int, int]]] = defaultdict(set)
+    wire_by_point: dict[tuple[int, int], list[RawWire]] = defaultdict(list)
+    
+    for wire in circuit.wires:
+        s, e = tuple(wire.start), tuple(wire.end)
+        adj[s].add(e)
+        adj[e].add(s)
+        wire_by_point[s].append(wire)
+        wire_by_point[e].append(wire)
+
+    # 3. BFS 查找所有导线连通分量 (Nets)
+    visited_points: set[tuple[int, int]] = set()
+    wires_to_keep: set[id] = set()
+    
+    all_points = sorted(adj.keys())
+    for p in all_points:
+        if p in visited_points:
+            continue
+        
+        # 发现新 Net
+        net_points: list[tuple[int, int]] = []
+        queue = deque([p])
+        visited_points.add(p)
+        has_anchor = False
+        
+        while queue:
+            curr = queue.popleft()
+            net_points.append(curr)
+            if curr in all_anchors:
+                has_anchor = True
+            
+            for neighbor in adj[curr]:
+                if neighbor not in visited_points:
+                    visited_points.add(neighbor)
+                    queue.append(neighbor)
+        
+        # 如果这个 Net 接触到了锚点，保留其所有导线
+        if has_anchor:
+            # 收集该 Net 涉及的所有导线 ID
+            for np in net_points:
+                for wire in wire_by_point[np]:
+                    wires_to_keep.add(id(wire))
+
+    # 4. 执行删除
+    original_count = len(circuit.wires)
+    circuit.wires = [w for w in circuit.wires if id(w) in wires_to_keep]
+    return original_count - len(circuit.wires)
+
+
+def _component_connection_points(component: RawComponent, *, project: RawProject | None = None) -> set[tuple[int, int]]:
+    """获取组件的所有电气连接点。逻辑与 high_level.py 同步。"""
+    points = {tuple(component.loc)}
+    try:
+        from .geometry import get_component_geometry
+        geometry = get_component_geometry(component, project=project)
+    except Exception:
+        return points
+    base_x, base_y = component.loc
+    for port in geometry.ports:
+        points.add((base_x + port.offset[0], base_y + port.offset[1]))
+    return points

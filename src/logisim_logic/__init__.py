@@ -1,128 +1,63 @@
-from .builder import CircuitBuilder, component, orthogonal, pt
-from .compare import ProjectDiff, compare_project_files, compare_projects, project_signature
-from .diagnostics import WidthConflict, WidthDeterminant, find_invalid_wire_indexes, find_width_conflicts, has_width_conflicts
-from .geometry import ComponentGeometry, PortGeometry, get_component_geometry, get_component_visual_bounds, resolve_library_label
-from .graph import WireGraph, build_wire_graph
-from .high_level import CircuitEditor, ProjectFacade
-from .java_types import BitWidth, Direction, Location
-from .layout import (
-    PortAttachmentPlacement,
-    attachment_facing_for_port,
-    ComponentOverlap,
-    combine_bounds,
-    component_bounds,
-    component_extents,
-    default_splitter_pitch,
-    expand_bounds,
-    find_component_overlaps,
-    layout_column_locations,
-    layout_row_locations,
-    place_attached_component,
-    spec_extents,
-)
-from .logical import LogicalCircuit, extract_logical_circuit
-from .logic_builder import EndpointRef, LogicCircuitBuilder, LogicInstanceSpec, LogicNetSpec
-from .model import (
-    CircuitPort,
-    RawAppearance,
-    RawAttribute,
-    RawCircuit,
-    RawComponent,
-    RawLibrary,
-    RawMain,
-    RawMappings,
-    RawMessage,
-    RawOptions,
-    RawProject,
-    RawTool,
-    RawToolbar,
-    RawToolbarItem,
-    RawWire,
-    XmlFragment,
-)
-from .project_tools import clone_project, remove_circuit, rename_circuit, replace_circuit, set_main
-from .rom import gb2312_word_stream, raw_contents_from_words, rom_contents_from_words, rom_image_from_contents, rom_words_from_contents
-from .selection import ComponentSelector, SelectorView, select_component, select_tunnel, selector_view
-from .template_tools import CircuitTemplate
+from __future__ import annotations
+
 from .xml_io import load_project, save_project
+from .model import RawCircuit, RawComponent, RawWire, RawAttribute, Point
+from .logical import LogicalCircuit, LogicalInstance, LogicalNet, LogicalEndpoint, extract_logical_circuit
+from .rebuild_support import (
+    add_component,
+    add_polyline,
+    add_splitter,
+    add_tunnel,
+    add_tunnel_on_port,
+    add_tunnel_to_port,
+    add_wire,
+    component_port_point as port_point,
+    connect_points_routed,
+    connect_ports_routed,
+    find_component,
+    get_attribute,
+    set_attribute,
+    set_attributes,
+)
+from .geometry import get_component_geometry, get_component_visual_bounds
+from .high_level import ProjectFacade, CircuitEditor
+
+# 别名，用于提高 LLM 亲和力
+component = RawComponent
+Instance = RawComponent
+circuit = RawCircuit
+wire = RawWire
+load_project_facade = ProjectFacade.load
 
 __all__ = [
-    "BitWidth",
-    "CircuitBuilder",
-    "CircuitPort",
-    "ComponentGeometry",
-    "Direction",
-    "EndpointRef",
-    "find_width_conflicts",
-    "has_width_conflicts",
-    "LogicalCircuit",
-    "LogicCircuitBuilder",
-    "LogicInstanceSpec",
-    "LogicNetSpec",
-    "Location",
-    "PortGeometry",
-    "ProjectDiff",
-    "RawAppearance",
-    "RawAttribute",
+    "load_project",
+    "save_project",
     "RawCircuit",
     "RawComponent",
-    "RawLibrary",
-    "RawMain",
-    "RawMappings",
-    "RawMessage",
-    "RawOptions",
-    "RawProject",
-    "RawTool",
-    "RawToolbar",
-    "RawToolbarItem",
     "RawWire",
-    "WireGraph",
-    "WidthConflict",
-    "WidthDeterminant",
-    "XmlFragment",
-    "PortAttachmentPlacement",
-    "build_wire_graph",
-    "clone_project",
-    "combine_bounds",
-    "component_bounds",
-    "component_extents",
-    "ComponentSelector",
-    "compare_project_files",
-    "compare_projects",
-    "component",
-    "default_splitter_pitch",
-    "expand_bounds",
+    "RawAttribute",
+    "Point",
+    "LogicalCircuit",
+    "LogicalInstance",
+    "LogicalNet",
+    "LogicalEndpoint",
     "extract_logical_circuit",
-    "CircuitEditor",
-    "find_component_overlaps",
-    "find_invalid_wire_indexes",
+    "add_component",
+    "add_splitter",
+    "add_wire",
+    "add_polyline",
+    "add_tunnel",
+    "add_tunnel_to_port",
+    "add_tunnel_on_port",
+    "find_component",
+    "get_attribute",
+    "set_attribute",
+    "set_attributes",
+    "port_point",
+    "connect_ports_routed",
+    "connect_points_routed",
     "get_component_geometry",
     "get_component_visual_bounds",
-    "attachment_facing_for_port",
-    "gb2312_word_stream",
-    "layout_column_locations",
-    "layout_row_locations",
-    "load_project",
-    "orthogonal",
-    "place_attached_component",
-    "pt",
-    "raw_contents_from_words",
-    "project_signature",
-    "remove_circuit",
-    "rename_circuit",
-    "replace_circuit",
-    "resolve_library_label",
-    "CircuitTemplate",
     "ProjectFacade",
-    "ComponentOverlap",
-    "rom_contents_from_words",
-    "rom_image_from_contents",
-    "rom_words_from_contents",
-    "save_project",
-    "select_component",
-    "selector_view",
-    "SelectorView",
-    "select_tunnel",
-    "set_main",
-    "spec_extents",
+    "CircuitEditor",
 ]

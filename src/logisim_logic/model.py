@@ -272,6 +272,38 @@ class RawComponent:
     extra_attrs: dict[str, str] = field(default_factory=dict)
     other_children: list[XmlFragment] = field(default_factory=list)
 
+    @property
+    def type(self) -> str:
+        return self.name
+
+    @property
+    def type_name(self) -> str:
+        return self.name
+
+    @property
+    def label(self) -> str:
+        for attr in self.attrs:
+            if attr.name == "label":
+                return attr.value or ""
+        return ""
+
+    @property
+    def x(self) -> int:
+        return self.loc.x
+
+    @property
+    def y(self) -> int:
+        return self.loc.y
+
+    @label.setter
+    def label(self, value: str):
+        for attr in self.attrs:
+            if attr.name == "label":
+                attr.value = value
+                return
+        from .model import RawAttribute
+        self.attrs.append(RawAttribute(name="label", value=value))
+
     def attr_map(self) -> dict[str, str]:
         return _attr_map(self.attrs)
 
@@ -287,11 +319,25 @@ class RawComponent:
     def set(self, name: str, value: Any, *, as_text: bool | None = None) -> None:
         _set_attr(self.attrs, name, value, as_text=as_text)
 
+    def set_attribute(self, name: str, value: Any, *, as_text: bool | None = None) -> None:
+        return self.set(name, value, as_text=as_text)
+
+    def get_attribute(self, name: str, default: str | None = None) -> str | None:
+        return self.get(name, default=default)
+
     def delete(self, name: str) -> None:
         self.attrs = _delete_attr(self.attrs, name)
 
+    @property
     def location(self) -> Location:
         return point_to_location(self.loc)
+
+    def get_location(self) -> Location:
+        return self.location
+
+    def get_bounds(self, project: RawProject | None = None) -> Bounds:
+        from .layout import component_bounds
+        return component_bounds(self, project=project)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -471,6 +517,9 @@ class RawCircuit:
             if (name is None or component.name == name) and (lib is None or component.lib == lib)
         ]
 
+    def get_components(self, *, name: str | None = None, lib: str | None = None) -> list[RawComponent]:
+        return self.find_components(name=name, lib=lib)
+
     def pin_components(self) -> list[RawComponent]:
         return [component for component in self.components if component.name == "Pin"]
 
@@ -485,7 +534,7 @@ class RawCircuit:
 
     def explicit_port_offsets(self, facing: str | Direction = EAST) -> list[CircuitPort]:
         facing_dir = Direction.parse(facing) if isinstance(facing, str) else facing
-        pin_by_location = {component.location(): component for component in self.pin_components()}
+        pin_by_location = {component.location: component for component in self.pin_components()}
         anchor, default_facing = self._anchor_location_and_facing()
         found: list[tuple[Location, RawComponent]] = []
         for shape in self.iter_appearance_shapes():
@@ -699,6 +748,9 @@ class RawProject:
     messages: list[RawMessage] = field(default_factory=list)
     other_root_children: list[XmlFragment] = field(default_factory=list)
     item_order: list[tuple[str, int]] = field(default_factory=list)
+
+    def circuit_names(self) -> list[str]:
+        return [circuit.name for circuit in self.circuits]
 
     def circuit(self, name: str) -> RawCircuit:
         for circuit in self.circuits:

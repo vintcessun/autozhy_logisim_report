@@ -1,0 +1,11 @@
+你是实验报告撰写专家。阅读以下实验指导书和参考资料，提取并生成三项内容。
+
+【指导书和参考报告内容】
+{reference_content}
+
+输出 JSON：
+{
+  "experiment_environment": "操作系统、Logisim 版本、JDK 要求等",
+  "experiment_objective":   "(1)验证...\n(2)设计...",
+  "abstract":               "本次实验整体要求和目标的综述（约200字）"
+}

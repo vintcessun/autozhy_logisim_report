@@ -1,62 +1,74 @@
 import os
 import shutil
+import zipfile
+import re
 from pathlib import Path
-import patoolib
 import pdfplumber
 from docx import Document
-from typing import List
+from typing import List, Dict, Optional, Tuple
 from google import genai
-from ..core.models import TaskRecord
+from ..core.models import TaskRecord, ParsingResult
 
 class DataDecompressor:
-    """递归解压工具，利用 patool 支持多种格式"""
+    """递归解压工具，支持处理中文乱码 (GBK 编码)"""
     
-    def __init__(self, workspace_dir: Path, bin_7z_path: str = "3rd/7z.exe"):
+    def __init__(self, workspace_dir: Path):
         self.workspace_dir = workspace_dir
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 将 7z 所在目录加入 PATH，以便 patool 找到它
-        bin_dir = str(Path(bin_7z_path).parent.absolute())
-        if bin_dir not in os.environ["PATH"]:
-            os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
 
     def unzip_recursive(self, src_path: Path):
         """
         递归解压并将所有内容平铺到 workspace 目录。
-        符合 ADR-0001: '平铺到工作区'。
+        解决 zipfile 在 Windows 上处理中文名乱码的问题。
         """
-        temp_extract_dir = self.workspace_dir / "temp_extract"
-        temp_extract_dir.mkdir(exist_ok=True)
+        if not zipfile.is_zipfile(src_path):
+            return
+
+        ref_pattern = re.compile(r"^\d+[\+\s\-_]+[\u4e00-\u9fa5]+")
+        is_reference = ref_pattern.search(src_path.name) is not None
         
         try:
-            # 使用 patool 解压
-            patoolib.extract_archive(str(src_path), outdir=str(temp_extract_dir), verbosity=-1)
-            
-            # 遍历提取后的内容
-            for root, dirs, files in os.walk(temp_extract_dir):
-                for file in files:
-                    file_path = Path(root) / file
-                    # 如果是压缩包，递归处理
-                    if self._is_archive(file_path):
-                        self.unzip_recursive(file_path)
-                    else:
-                        # 平铺：直接移动到 workspace 根目录（处理重名冲突）
-                        target_path = self.workspace_dir / file
-                        if target_path.exists():
-                            target_path = self.workspace_dir / f"{src_path.stem}_{file}"
-                        shutil.move(str(file_path), str(target_path))
-        finally:
-            # 清理临时目录
-            if temp_extract_dir.exists():
-                shutil.rmtree(temp_extract_dir)
+            with zipfile.ZipFile(src_path, 'r') as zip_ref:
+                for info in zip_ref.infolist():
+                    # 关键点：处理文件名编码
+                    # ZipFile 默认使用 cp437，中文文件名通常需要转为 gbk
+                    try:
+                        filename = info.filename.encode('cp437').decode('gbk')
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        filename = info.filename
+                    
+                    if info.is_dir():
+                        continue
+                        
+                    # 提取基础文件名，忽略目录结构
+                    bare_name = Path(filename).name
+                    if not bare_name:
+                        continue
+                        
+                    prefix = "REF_" if is_reference else "TEA_"
+                    target_name = f"{prefix}{bare_name}"
+                    target_path = self.workspace_dir / target_name
+                    
+                    if target_path.exists():
+                        target_path = self.workspace_dir / f"{prefix}{src_path.stem}_{bare_name}"
 
-    def _is_archive(self, file_path: Path) -> bool:
-        """判断是否为压缩格式"""
-        extensions = ('.zip', '.rar', '.7z', '.tar', '.gz')
-        return file_path.suffix.lower() in extensions
+                    # 执行解压并重命名
+                    with zip_ref.open(info) as source, open(target_path, "wb") as target:
+                        shutil.copyfileobj(source, target)
+                    
+                    # 递归处理提取出来的 ZIP (如果有的话)
+                    if target_path.suffix.lower() == '.zip':
+                        self.unzip_recursive(target_path)
+                        
+        except Exception as e:
+            print(f"解压 {src_path.name} 失败: {e}")
+
+    def _is_zip(self, file_path: Path) -> bool:
+        """判断是否为 ZIP 格式"""
+        return file_path.suffix.lower() == '.zip'
 
 class RequirementExtractor:
-    """需求提取器，利用 pdfplumber 和 python-docx"""
+    """需求提取器，利用 LLM 进行关联匹配"""
     
     def __init__(self, client, model_name: str):
         self.client = client
@@ -82,119 +94,307 @@ class RequirementExtractor:
             print(f"警告: 无法从 DOCX {docx_path.name} 提取文本: {e}")
             return ""
 
-    async def parse_tasks_with_llm(self, text: str, prompt_template: str) -> List[dict]:
-        """利用 Gemini 3 Flash 将文本转化为结构化任务清单"""
-        if not self.client:
-            return {}
+    @staticmethod
+    def _extract_json(raw: str) -> str:
+        """
+        从 LLM 原始输出中提取合法的 JSON 字符串。
+        处理以下情况：
+          1. 被 ```json ... ``` 或 ``` ... ``` 包裹
+          2. 前后有多余文字，用正则提取第一个完整的 { } 或 [ ] 块
+          3. JSON 截断（不完整），返回空字符串留给调用方处理
+        """
+        import re as _re, json as _json
 
-        prompt = f"{prompt_template}\n\n待解析文本：\n{text}"
-        
-        # 使用现代 SDK 语法与重试机制
+        text = raw.strip()
+
+        # 1. 去除 markdown 代码块包裹
+        md_fence = _re.match(r'^```(?:json)?\s*\n?(.*?)\n?```\s*$', text, _re.DOTALL)
+        if md_fence:
+            text = md_fence.group(1).strip()
+
+        # 2. 如果已经是合法 JSON，直接返回
+        try:
+            _json.loads(text)
+            return text
+        except Exception:
+            pass
+
+        # 3. 正则提取第一个完整的 JSON 对象 {...} 或数组 [...]
+        for pattern in (r'(\{.*\})', r'(\[.*\])'):
+            m = _re.search(pattern, text, _re.DOTALL)
+            if m:
+                candidate = m.group(1)
+                try:
+                    _json.loads(candidate)
+                    return candidate
+                except Exception:
+                    pass
+
+        return ""
+
+    async def _call_with_json_retry(self, prompt: str, context_label: str,
+                                     max_json_retries: int = 2) -> str:
+        """
+        调用 LLM 并确保返回合法 JSON 字符串。
+        若 JSON 解析失败，将错误内容发回 LLM 要求自修复，最多重试 max_json_retries 次。
+        """
         from ..utils.ai_utils import retry_llm_call
+        import json as _json
+
         response = await retry_llm_call(
             self.client.models.generate_content,
             model=self.model_id,
             contents=prompt,
-            config={
-                'response_mime_type': 'application/json',
-            }
+            config={'response_mime_type': 'application/json'}
         )
-        
-        import json
-        try:
-            # 去除可能存在的 markdown 标记
-            content = response.text.strip()
-            if content.startswith("```json"):
-                content = content[7:-3].strip()
-            return json.loads(content)
-        except Exception as e:
-            print(f"解析 Gemini 返回的 JSON 失败: {e}")
-            return {}
+        raw = response.text
 
-class CircAssociator:
-    """电路关联器，将电路文件与任务进行匹配"""
-    
-    def match_tasks(self, tasks: List[TaskRecord], circ_files: List[Path]) -> List[TaskRecord]:
-        """将电路文件与提取的任务进行匹配"""
-        circ_map = {f.stem.lower(): f for f in circ_files}
-        for task in tasks:
-            # 基础匹配：按名称匹配
-            task_name_lower = task.task_name.lower()
-            for stem, path in circ_map.items():
-                if stem in task_name_lower or task_name_lower in stem:
-                    task.source_circ = [str(path)]
-                    break
-        return tasks
+        for attempt in range(max_json_retries + 1):
+            extracted = self._extract_json(raw)
+            if extracted:
+                try:
+                    _json.loads(extracted)
+                    return extracted
+                except Exception:
+                    pass
+
+            if attempt < max_json_retries:
+                print(f"[JSON 自修复] {context_label} 第 {attempt+1} 次尝试失败，请求 LLM 修复...")
+                repair_prompt = (
+                    "以下 JSON 输出不完整或格式有误，请原样修复并输出完整合法的 JSON，不要添加任何解释：\n\n"
+                    + raw[:3000]
+                )
+                response = await retry_llm_call(
+                    self.client.models.generate_content,
+                    model=self.model_id,
+                    contents=repair_prompt,
+                    config={'response_mime_type': 'application/json'}
+                )
+                raw = response.text
+            else:
+                print(f"[JSON 解析失败] {context_label} 达到最大重试次数，原始输出前 300 字：\n{raw[:300]}")
+
+        return ""
+
+    async def phase1_classify(self, text: str, prompt_template: str, teacher_files: List[str], reference_files: List[str]) -> dict:
+        """阶段一：识别所有实验模块，分类并提取各模块对应的原文段落"""
+        if not self.client:
+            return {"experiments": []}
+
+        prompt = prompt_template.replace("{{teacher_files}}", "\n".join(teacher_files) if teacher_files else "无")
+        prompt = prompt.replace("{{reference_files}}", "\n".join(reference_files) if reference_files else "无")
+        prompt = f"{prompt}\n\n待解析全文：\n{text}"
+
+        import json as _json
+        extracted = await self._call_with_json_retry(prompt, "阶段一分类")
+        if not extracted:
+            return {"experiments": []}
+        try:
+            return _json.loads(extracted)
+        except Exception as e:
+            print(f"阶段一最终解析失败: {e}")
+            return {"experiments": []}
+
+    async def phase2_detail_verify(self, experiment: dict, prompt_template: str) -> List[dict]:
+        """阶段二：仅针对验证性实验，将其 section_text 拆解为原子测试用例列表"""
+        if not self.client:
+            return []
+
+        prompt = prompt_template.replace("{{experiment_name}}", experiment.get("name", ""))
+        prompt = prompt.replace("{{source_circ}}", experiment.get("matched_source_circ") or "无")
+        prompt = prompt.replace("{{target_subcircuit}}", experiment.get("target_subcircuit") or "main")
+        prompt = prompt.replace("{{section_text}}", experiment.get("section_text", ""))
+
+        import json as _json
+        label = f"阶段二[{experiment.get('name', '?')}]"
+        extracted = await self._call_with_json_retry(prompt, label)
+        if not extracted:
+            return []
+        try:
+            result = _json.loads(extracted)
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("tasks", result.get("items", []))
+            return []
+        except Exception as e:
+            print(f"{label} 最终解析失败: {e}")
+            return []
+
+    # 保留旧方法兼容性（单元测试用）
+    async def parse_tasks_with_llm(self, text: str, prompt_template: str, teacher_files: List[str], reference_files: List[str]) -> dict:
+        return await self.phase1_classify(text, prompt_template, teacher_files, reference_files)
+
 
 class ContentParsingAgent:
     """内容解析智能体总控"""
     
     def __init__(self, config, workspace_dir: Path, client):
         self.decompressor = DataDecompressor(workspace_dir)
-        # 初始化现代版需求提取器
         self.extractor = RequirementExtractor(client, config.gemini.model_flash)
-        self.associator = CircAssociator()
+        self.workspace_dir = workspace_dir
 
-    async def run(self, input_dir: Path) -> List[TaskRecord]:
+    def _categorize_workspace_files(self) -> Dict[str, List[Path]]:
         """
-        执行内容解析全流程：
-        1. 递归解压所有包并平铺。
-        2. 搜索指导书与报告样本。
-        3. 提取文本并利用 LLM 结构化。
-        4. 关联电路文件。
+        对工作区内已平铺（且带 TEA_/REF_ 前缀）的文件进行分类。
         """
-        # 1. 解压与扫描输入
-        if not input_dir.exists():
-            return []
+        files = list(self.workspace_dir.iterdir())
+        categories = {
+            "instruction_pdf": [],
+            "report_template": [],
+            "teacher_circuits": [],
+            "reference_circuits": [],
+            "reference_reports": [],
+            "other": []
+        }
+
+        for f in files:
+            name = f.name
+            suffix = f.suffix.lower()
+            is_ref = name.startswith("REF_")
+            is_tea = name.startswith("TEA_")
             
-        for item in input_dir.iterdir():
-            if self.decompressor._is_archive(item):
-                self.decompressor.unzip_recursive(item)
-            elif item.suffix.lower() in ('.circ', '.pdf', '.docx'):
-                shutil.copy(item, self.decompressor.workspace_dir / item.name)
-        
-        # 2. 在平铺后的工作区中寻找指导书 (.pdf, .docx)
-        workspace_files = list(self.decompressor.workspace_dir.iterdir())
-        instruction_files = [f for f in workspace_files if f.suffix.lower() in ('.pdf', '.docx')]
-        circ_files = [f for f in workspace_files if f.suffix.lower() == '.circ']
-        
-        if not instruction_files:
-            # 没找到指导书，可能是纯电路包
-            return [TaskRecord(task_name=f.stem, task_type="verification", source_circ=[str(f)]) for f in circ_files]
+            # 去掉前缀进行关键字判断
+            pure_name = name[4:] if (is_ref or is_tea) else name
 
-        # 3. 提取所有指导书文本
-        raw_text = ""
-        for f in instruction_files:
-            if f.suffix.lower() == '.pdf':
-                raw_text += self.extractor.extract_text_from_pdf(f)
+            if suffix == ".pdf":
+                if is_tea and ("实验" in pure_name or "指导" in pure_name):
+                    categories["instruction_pdf"].append(f)
+                elif is_ref:
+                    categories["reference_reports"].append(f)
+                else:
+                    categories["other"].append(f)
+            elif suffix == ".docx":
+                if is_tea and ("报告" in pure_name or "模板" in pure_name or "样本" in pure_name):
+                    categories["report_template"].append(f)
+                elif is_ref:
+                    categories["reference_reports"].append(f)
+                else:
+                    categories["other"].append(f)
+            elif suffix == ".circ":
+                if is_ref:
+                    categories["reference_circuits"].append(f)
+                else:
+                    categories["teacher_circuits"].append(f)
             else:
-                raw_text += self.extractor.extract_text_from_docx(f)
-        
-        # 4. 调用 LLM 提取任务大纲
-        prompt_path = Path("prompts/parsing/task_extraction.txt")
-        template = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else "提取实验任务内容"
-        
-        parsed_data = await self.extractor.parse_tasks_with_llm(raw_text, template)
-        
-        # 5. 组织 TaskRecord 列表
-        objective = parsed_data.get("objective", "")
-        environment = parsed_data.get("environment", "")
-        thinking_qs = parsed_data.get("thinking_questions", [])
-        
-        tasks: List[TaskRecord] = []
-        for task_item in parsed_data.get("tasks", []):
-            task = TaskRecord(
-                task_name=task_item.get("task_name", "未命名任务"),
-                task_type=task_item.get("task_type", "verification"),
-                analysis_raw=task_item.get("description", ""),
-                target_subcircuit=task_item.get("target_subcircuit"),
-                experiment_objective=objective,
-                experiment_environment=environment,
-                thinking_questions=thinking_qs
-            )
-            tasks.append(task)
+                categories["other"].append(f)
+                
+        return categories
+
+    async def run(self, input_dir: Path) -> ParsingResult:
+        """执行内容解析全流程"""
+        if not input_dir.exists():
+            return ParsingResult()
             
-        # 6. 电路关联
-        self.associator.match_tasks(tasks, circ_files)
-            
-        return tasks
+        # 0. 清理工作区，确保是幂等的全新运行
+        if self.workspace_dir.exists():
+            shutil.rmtree(self.workspace_dir)
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. 扫描输入目录，优先提取任务文本
+        raw_text = ""
+        input_files = list(input_dir.iterdir())
+        for item in input_files:
+            suffix = item.suffix.lower()
+            if suffix == ".pdf":
+                raw_text += self.extractor.extract_text_from_pdf(item)
+            elif suffix == ".docx":
+                raw_text += self.extractor.extract_text_from_docx(item)
+        
+        # 2. 扫描并解压/拷贝所有文件到工作区
+        ref_pattern = re.compile(r"^\d+[\+\s\-_]+[\u4e00-\u9fa5]+")
+        for item in input_files:
+            suffix = item.suffix.lower()
+            if suffix == '.zip':
+                self.decompressor.unzip_recursive(item)
+            elif suffix in ('.circ', '.pdf', '.docx'):
+                is_ref = ref_pattern.search(item.name) is not None
+                prefix = "REF_" if is_ref else "TEA_"
+                shutil.copy(item, self.workspace_dir / f"{prefix}{item.name}")
+        
+        # 3. 分类工作区文件
+        cat = self._categorize_workspace_files()
+        
+        # 兜底读取解压后的指导书
+        if not raw_text:
+            for f in cat["instruction_pdf"]:
+                raw_text += self.extractor.extract_text_from_pdf(f)
+        
+        # 4. 准备文件清单
+        tea_names = [f.name for f in cat["teacher_circuits"]]
+        ref_names = [f.name for f in cat["reference_circuits"]]
+
+        # =========================================================
+        # 阶段一：高层次分类——识别所有实验模块、类型、对应原文、电路关联
+        # =========================================================
+        p1_path = Path("prompts/parsing/phase1_classify.txt")
+        p1_template = p1_path.read_text(encoding="utf-8") if p1_path.exists() else ""
+        print("📋 [阶段一] 正在分类实验模块...")
+        phase1_data = await self.extractor.phase1_classify(raw_text, p1_template, tea_names, ref_names)
+        experiments = phase1_data.get("experiments", [])
+        print(f"   → 识别出 {len(experiments)} 个实验模块")
+
+        # =========================================================
+        # 阶段二：仅对验证性实验进行原子级拆解
+        # =========================================================
+        p2_path = Path("prompts/parsing/phase2_verify_detail.txt")
+        p2_template = p2_path.read_text(encoding="utf-8") if p2_path.exists() else ""
+
+        all_tasks: List[TaskRecord] = []
+
+        for exp in experiments:
+            exp_name = exp.get("name", "未命名")
+            exp_type = exp.get("task_type", "verification")
+            exp_section = exp.get("section_text", "")     # Phase 1 提取的原始段落
+            exp_desc = exp.get("description", "")
+            s_name = exp.get("matched_source_circ")
+            r_name = exp.get("matched_reference_circ")
+            source_path = [str(self.workspace_dir / s_name)] if s_name and s_name != "null" else []
+            ref_path = str(self.workspace_dir / r_name) if r_name and r_name != "null" else None
+
+            if exp_type == "verification":
+                # 阶段二：拆解为原子测试用例，同时把 section_text 喂入
+                print(f"   🔬 [阶段二] 细化验证实验: {exp_name}")
+                sub_items = await self.extractor.phase2_detail_verify(exp, p2_template)
+                print(f"      → 拆解出 {len(sub_items)} 条测试用例")
+                for sub in sub_items:
+                    task = TaskRecord(
+                        task_name=sub.get("task_name", exp_name),
+                        task_type="verification",
+                        analysis_raw=sub.get("description", ""),
+                        section_text=exp_section,       # 保留原始段落供下游引用
+                        target_subcircuit=exp.get("target_subcircuit"),
+                        experiment_objective=exp_desc,
+                        experiment_environment="",
+                        thinking_questions=[]
+                    )
+                    task.source_circ = source_path
+                    all_tasks.append(task)
+
+            else:
+                # 设计性/挑战性实验：保持单条，section_text 存入完整描述
+                task = TaskRecord(
+                    task_name=exp_name,
+                    task_type=exp_type,
+                    analysis_raw=exp_desc,
+                    section_text=exp_section,           # 保留原始段落供下游引用
+                    target_subcircuit=exp.get("target_subcircuit"),
+                    experiment_objective=exp.get("description", ""),
+                    experiment_environment="",
+                    thinking_questions=[]
+                )
+                task.source_circ = source_path
+                task.reference_circ = ref_path
+                all_tasks.append(task)
+
+        result = ParsingResult()
+        result.verification_tasks = [t for t in all_tasks if t.task_type == "verification"]
+        result.design_tasks = [t for t in all_tasks if t.task_type in ("design", "challenge")]
+        result.reference_reports = [str(f) for f in cat["reference_reports"]]
+        result.instruction_docs = (
+            [str(f) for f in cat["instruction_pdf"]] +
+            [str(f) for f in cat["report_template"]]
+        )
+        result.raw_experiments = experiments   # 阶段一全量数据（含 section_text），供下游全量参考
+        
+        return result

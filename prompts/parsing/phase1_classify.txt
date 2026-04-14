@@ -1,0 +1,41 @@
+你是实验指导书分类专家，目标是**完整、无遗漏**地列出指导书中所有实验模块。
+
+---
+### 第一步：从目录中枚举所有实验模块
+
+指导书通常以"目录"或章节标题开头。你必须先识别目录中列出的**每一个子实验项**（如 "1、4位先行进位电路"、"2、4位快速加法器"），确保后续输出完整覆盖，不遗漏任何一项。
+
+---
+### 第二步：对每个模块进行分类并提取完整原文段落
+
+对每一个子实验项，输出对应的 JSON 对象，包含：
+- `name`: 实验子项名称（精确，如 "4位先行进位电路"、"16位快速加法器（组内并行、组间串行）"）。
+- `task_type`: 只能是 "design"（设计实验）/ "verification"（验证实验）/ "challenge"（挑战性实验）。
+- `target_subcircuit`: 对应子电路名称。
+- `description`: 1-2句对该实验的整体说明。
+- `section_text`: **关键**：从原文中**完整复制**该子项对应的所有描述文字，包括所有的输入输出参数、①②③验证步骤、具体数值（如 X=FFFFFFF0）。不得截断或摘要，必须原样复制。
+- `matched_source_circ`: 对应的起步电路文件名（从下方列表中选取最匹配的），或 null。
+- `matched_reference_circ`: 对应的参考电路文件名（仅 design/challenge 任务，从下方列表中），或 null。
+
+---
+### 上下文信息：
+[教师起步电路清单]：{{teacher_files}}
+[参考成品电路清单]：{{reference_files}}
+
+---
+### 输出格式：
+```json
+{
+  "experiments": [
+    {
+      "name": "子实验名称",
+      "task_type": "verification",
+      "target_subcircuit": "子电路名",
+      "description": "整体说明",
+      "section_text": "从原文完整复制的该子项所有文字...",
+      "matched_source_circ": "TEA_xxx.circ 或 null",
+      "matched_reference_circ": "REF_xxx.circ 或 null"
+    }
+  ]
+}
+```

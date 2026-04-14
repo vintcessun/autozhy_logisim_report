@@ -1,5 +1,6 @@
 import asyncio
 import ctypes
+import shutil
 from pathlib import Path
 from google import genai
 
@@ -32,8 +33,13 @@ async def main():
         return
     app_config = ConfigManager.load_config(config_path)
     
+    # 清理 output 目录
+    output_dir = Path("output")
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     # 2. 配置现代 SDK 客户端
-    # 自动清洗 base_url 中的版本后缀，以便新 SDK 正确处理
     endpoint = app_config.gemini.base_url.rstrip('/')
     if endpoint.endswith('/v1beta'):
         endpoint = endpoint[:-7]
@@ -45,49 +51,68 @@ async def main():
         http_options={'base_url': endpoint}
     )
 
-    # 3. 初始化并注入客户端到智能体
+    # 3. 初始化智能体
     workspace_dir = Path("workspace")
     input_dir = Path("data_in")
     
-    # 全部通过注入 client 和具体型号名来解耦
     parsing_agent = ContentParsingAgent(app_config, workspace_dir, client)
-    design_agent = DesignAgent(client, app_config.gemini.model_pro)
+    design_agent = DesignAgent(client, app_config, app_config.gemini.model_flash)
     verification_agent = VerificationAgent(app_config, client)
-    report_agent = ReportAgent(client, app_config.gemini.model_flash)
+    report_agent = ReportAgent(client, app_config.gemini.model_pro, app_config.gemini.model_flash)
 
+    # --- [1] 内容解析 ---
     print("--- [1] 启动内容解析 ---")
-    tasks = await parsing_agent.run(input_dir)
-    print(f"解析到 {len(tasks)} 条任务。")
+    parsing_result = await parsing_agent.run(input_dir)
+    print(f"解析到 {len(parsing_result.verification_tasks)} 条验证任务，{len(parsing_result.design_tasks)} 条设计任务。")
 
-    executed_tasks = []
-    for task in tasks:
-        print(f"--- [2] 处理任务: {task.task_name} ({task.task_type}) ---")
-        
-        # 获取关联电路
+    # --- [2] 验证性实验 ---
+    completed_verification = []
+    print("\n--- [2] 处理验证性实验 ---")
+    for task in parsing_result.verification_tasks:
         circ_file = workspace_dir / Path(task.source_circ[0]).name if task.source_circ else None
-        
-        if task.task_type == "design":
-            # 运行设计闭环码
-            task = await design_agent.run(task, circ_file)
-            # 设计完成后，同样需要验证
-            if task.status == "finished":
-                circ_file = Path(task.source_circ[0])
-                task = await verification_agent.run(task, circ_file)
-        else:
-            # 直接运行验证进程
-            if circ_file:
-                task = await verification_agent.run(task, circ_file)
-        
-        executed_tasks.append(task)
+        if circ_file and circ_file.exists():
+            task = await verification_agent.run(task, circ_file)
+        completed_verification.append(task)
 
-    print("--- [3] 生成最终实验报告 ---")
-    output_md = Path("output") / "实验报告.md"
-    await report_agent.orchestrate(executed_tasks, output_md)
+    # --- [3] 设计性实验 ---
+    completed_design = []
+    all_design_subs = []
+    print("\n--- [3] 处理设计性实验 ---")
+    for task in parsing_result.design_tasks:
+        source_circ = workspace_dir / Path(task.source_circ[0]).name if task.source_circ else None
+        ref_circ = workspace_dir / Path(task.reference_circ).name if task.reference_circ else None
+        
+        # 3a. DesignAgent: 截图 + 拷贝 + 拆解
+        task, sub_tasks = await design_agent.run(task, source_circ, ref_circ)
+        completed_design.append(task)
+        
+        # 3b. 验证子任务
+        for sub in sub_tasks:
+            # 子任务继承了命好名后的电路路径
+            sub_circ = Path(sub.source_circ[0])
+            if sub_circ.exists():
+                sub = await verification_agent.run(sub, sub_circ)
+            all_design_subs.append(sub)
+
+    # --- [4] 生成最终实验报告 ---
+    print("\n--- [4] 生成最终实验报告 ---")
+    output_md = output_dir / "实验报告.md"
+    await report_agent.generate(
+        verification_tasks=completed_verification,
+        design_tasks=completed_design,
+        design_sub_tasks=all_design_subs,
+        instruction_docs=parsing_result.instruction_docs,
+        reference_reports=parsing_result.reference_reports,
+        output_path=output_md
+    )
     
     # 清理资源
     verification_agent.close()
     
-    print(f"✨ 全流程执行完毕！报告已保存至: {output_md}")
+    print(f"\n✨ 全流程执行完毕！")
+    print(f"   报告保存至: {output_md}")
+    print(f"   电路归档至: {output_dir}/提交电路/")
+    print(f"   资源保存至: {output_dir}/实验报告.assets/")
 
 if __name__ == "__main__":
     asyncio.run(main())

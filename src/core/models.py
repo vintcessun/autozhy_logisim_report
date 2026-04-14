@@ -11,9 +11,11 @@ class TaskRecord(BaseModel):
     task_name: str
     task_type: Literal["verification", "design", "challenge"]
     source_circ: List[str] = []  # 源码绝对路径
+    reference_circ: Optional[str] = None  # 参考设计电路路径
     status: Literal["pending", "executing", "finished", "failed"] = "pending"
     assets: List[str] = []       # 关联的截图路径 (相对于 .assets/)
-    analysis_raw: str = ""       # 原始分析文本
+    analysis_raw: str = ""       # 原始分析文本（原子场景描述）
+    section_text: str = ""       # 阶段一提取的原始 PDF 段落（供报告智能体引用）
     target_subcircuit: Optional[str] = None  # 明确指定的目标子电路名
     logic_check_pass: bool = False  # 拓扑可达性状态
     
@@ -21,6 +23,16 @@ class TaskRecord(BaseModel):
     experiment_objective: str = ""
     experiment_environment: str = ""
     thinking_questions: List[str] = []
+
+class ParsingResult(BaseModel):
+    """
+    内容解析智能体的结构化输出结果。
+    """
+    verification_tasks: List[TaskRecord] = []
+    design_tasks: List[TaskRecord] = []
+    reference_reports: List[str] = []  # 参考报告 (PDF/Docx) 的路径列表
+    instruction_docs: List[str] = []   # 教师指导书 + Word 模板
+    raw_experiments: List[dict] = []   # 阶段一原始实验分类列表（含 section_text，供下游全量参考）
 
 class LogicalNode(BaseModel):
     """CircuitSchema 中的逻辑节点"""
