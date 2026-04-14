@@ -32,20 +32,28 @@ class LogisimEmulator:
 
     async def send_command(self, action: str, **kwargs) -> dict:
         """发送 JSON 指令并等待响应"""
-        if not self.ws:
-            print("[Emulator] WebSocket 未连接，无法发送命令！")
-            return {"status": "error", "message": "No websocket connection"}
+        if not self.ws or self.ws.state != websockets.protocol.State.OPEN:
+            print("[Emulator] WebSocket 未连接或已断开，尝试自动重连可能已失效。")
+            return {"status": "error", "message": "connection_closed_or_not_found"}
 
         req_id = str(uuid.uuid4())
         req = {"action": action, "req_id": req_id, **kwargs}
         
         try:
             await self.ws.send(json.dumps(req))
-            resp = await self.ws.recv()
+            # 设置一个超时，避免 recv 永远阻塞
+            resp = await asyncio.wait_for(self.ws.recv(), timeout=10.0)
+            
             if isinstance(resp, bytes):
                 return {"status": "ok", "binary": resp}
             else:
                 return json.loads(resp)
+        except asyncio.TimeoutError:
+            print(f"[Emulator] 指令 '{action}' 等待响应超时 (10s)。")
+            return {"status": "error", "message": "timeout"}
+        except websockets.ConnectionClosed as e:
+            print(f"[Emulator] WebSocket 连接已在传输中关闭: {e}")
+            return {"status": "error", "message": "connection_lost"}
         except Exception as e:
             print(f"[Emulator] 发送指令异常: {e}")
             return {"status": "error", "message": str(e)}

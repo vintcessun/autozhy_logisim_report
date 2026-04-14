@@ -18,10 +18,11 @@ class DesignAgent:
     3. 任务拆解：调用 LLM 将设计要求拆解为细粒度的验证子任务。
     """
 
-    def __init__(self, client, config, model_flash: str):
+    def __init__(self, client, config, model_flash: str, cache=None):
         self.client = client
         self.config = config
         self.model_flash = model_flash
+        self.cache = cache
         self.project_root = Path(__file__).parents[2]
         self.prompt_dir = self.project_root / "prompts"
 
@@ -33,6 +34,13 @@ class DesignAgent:
     ) -> tuple[TaskRecord, list[TaskRecord]]:
         """主入口：执行截图、拷贝和拆解。"""
         print(f"\n[DesignAgent] 处理任务: {task.task_name}")
+
+        # 0. 检查缓存
+        if self.cache:
+            cached_main = self.cache.get_task_if_done(task)
+            cached_subs = self.cache.load_design_subtasks(task.task_id)
+            if cached_main and cached_subs is not None:
+                return cached_main, cached_subs
 
         # 1. 参考电路截图
         if reference_circ_path and reference_circ_path.exists():
@@ -46,6 +54,12 @@ class DesignAgent:
         sub_tasks = await self._decompose_to_subtasks(task)
 
         task.status = "finished"
+
+        # 4. 保存缓存
+        if self.cache:
+            self.cache.save_task(task)
+            self.cache.save_design_subtasks(task.task_id, sub_tasks)
+
         return task, sub_tasks
 
     async def _screenshot_reference(self, task: TaskRecord, ref_path: Path):
@@ -83,10 +97,10 @@ class DesignAgent:
         submit_dir = Path("output") / "提交电路"
         submit_dir.mkdir(parents=True, exist_ok=True)
         
-        target_path = submit_dir / f"{task.task_name}.circ"
+        target_path = (submit_dir / f"{task.task_name}.circ").absolute()
         shutil.copy2(source_path, target_path)
         
-        # 更新任务记录中的源码路径为新的命名路径
+        # 更新任务记录中的源码路径为新的绝对命名路径
         task.source_circ = [str(target_path)]
         print(f"[DesignAgent] 电路已归档: {target_path}")
 

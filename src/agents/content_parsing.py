@@ -133,7 +133,7 @@ class RequirementExtractor:
         return ""
 
     async def _call_with_json_retry(self, prompt: str, context_label: str,
-                                     max_json_retries: int = 2) -> str:
+                                     max_json_retries: int = 2, model_id: Optional[str] = None) -> str:
         """
         调用 LLM 并确保返回合法 JSON 字符串。
         若 JSON 解析失败，将错误内容发回 LLM 要求自修复，最多重试 max_json_retries 次。
@@ -141,9 +141,10 @@ class RequirementExtractor:
         from ..utils.ai_utils import retry_llm_call
         import json as _json
 
+        target_model = model_id or self.model_id
         response = await retry_llm_call(
             self.client.models.generate_content,
-            model=self.model_id,
+            model=target_model,
             contents=prompt,
             config={'response_mime_type': 'application/json'}
         )
@@ -166,7 +167,7 @@ class RequirementExtractor:
                 )
                 response = await retry_llm_call(
                     self.client.models.generate_content,
-                    model=self.model_id,
+                    model=target_model,
                     contents=repair_prompt,
                     config={'response_mime_type': 'application/json'}
                 )
@@ -221,6 +222,39 @@ class RequirementExtractor:
             print(f"{label} 最终解析失败: {e}")
             return []
 
+    async def phase3_check_subdivision(self, task_desc: str, prompt_template: str) -> bool:
+        """阶段三检查：利用 Flash 判断是否可进一步拆分"""
+        prompt = prompt_template.replace("{{task_description}}", task_desc)
+        label = "[阶段三/Check]"
+        
+        import json as _json
+        json_str = await self._call_with_json_retry(prompt, label)
+        if not json_str:
+            return False
+        try:
+            res = _json.loads(json_str)
+            return res.get("can_be_subdivided", False)
+        except:
+            return False
+
+    async def phase3_split_task(self, task_desc: str, section_text: str, prompt_template: str, model_pro: str) -> List[dict]:
+        """阶段三拆分：利用 Pro 将任务拆解为子任务"""
+        prompt = prompt_template.replace("{{task_description}}", task_desc)
+        prompt = prompt.replace("{{section_text}}", section_text)
+        label = "[阶段三/Split]"
+        
+        import json as _json
+        json_str = await self._call_with_json_retry(prompt, label, model_id=model_pro)
+        if not json_str:
+            return []
+        try:
+            res = _json.loads(json_str)
+            if isinstance(res, list):
+                return res
+            return []
+        except:
+            return []
+
     # 保留旧方法兼容性（单元测试用）
     async def parse_tasks_with_llm(self, text: str, prompt_template: str, teacher_files: List[str], reference_files: List[str]) -> dict:
         return await self.phase1_classify(text, prompt_template, teacher_files, reference_files)
@@ -229,10 +263,12 @@ class RequirementExtractor:
 class ContentParsingAgent:
     """内容解析智能体总控"""
     
-    def __init__(self, config, workspace_dir: Path, client):
+    def __init__(self, config, workspace_dir: Path, client, cache=None):
+        self.config = config
         self.decompressor = DataDecompressor(workspace_dir)
         self.extractor = RequirementExtractor(client, config.gemini.model_flash)
         self.workspace_dir = workspace_dir
+        self.cache = cache
 
     def _categorize_workspace_files(self) -> Dict[str, List[Path]]:
         """
@@ -285,6 +321,30 @@ class ContentParsingAgent:
         """执行内容解析全流程"""
         if not input_dir.exists():
             return ParsingResult()
+
+        # --- [Cache Verification] ---
+        if self.cache:
+            cached_result = self.cache.load_parsing_result()
+            if cached_result:
+                # 1. 时间戳拦截
+                cache_mtime = self.cache.parsing_file.stat().st_mtime
+                input_files = list(input_dir.glob("*"))
+                is_outdated = False
+                for f in input_files:
+                    if f.is_file() and f.stat().st_mtime > cache_mtime:
+                        is_outdated = True
+                        break
+                
+                if not is_outdated:
+                    # 2. LLM 二次确认
+                    print("[Cache] 正在通过 LLM 验证缓存一致性...")
+                    if await self._confirm_cache_with_llm(input_dir, cached_result):
+                        return cached_result
+                    else:
+                        print("[Cache] LLM 指示缓存不匹配，执行全新解析。")
+                else:
+                    print("[Cache] 输入文件已更新，缓存失效。")
+        # -----------------------------
             
         # 0. 清理工作区，确保是幂等的全新运行
         if self.workspace_dir.exists():
@@ -329,7 +389,7 @@ class ContentParsingAgent:
         # =========================================================
         p1_path = Path("prompts/parsing/phase1_classify.txt")
         p1_template = p1_path.read_text(encoding="utf-8") if p1_path.exists() else ""
-        print("📋 [阶段一] 正在分类实验模块...")
+        print("[阶段一] 正在分类实验模块...")
         phase1_data = await self.extractor.phase1_classify(raw_text, p1_template, tea_names, ref_names)
         experiments = phase1_data.get("experiments", [])
         print(f"   → 识别出 {len(experiments)} 个实验模块")
@@ -354,7 +414,7 @@ class ContentParsingAgent:
 
             if exp_type == "verification":
                 # 阶段二：拆解为原子测试用例，同时把 section_text 喂入
-                print(f"   🔬 [阶段二] 细化验证实验: {exp_name}")
+                print(f"   [阶段二] 细化验证实验: {exp_name}")
                 sub_items = await self.extractor.phase2_detail_verify(exp, p2_template)
                 print(f"      → 拆解出 {len(sub_items)} 条测试用例")
                 for sub in sub_items:
@@ -387,6 +447,8 @@ class ContentParsingAgent:
                 task.reference_circ = ref_path
                 all_tasks.append(task)
 
+        all_tasks = await self._refine_tasks_iteratively(all_tasks)
+
         result = ParsingResult()
         result.verification_tasks = [t for t in all_tasks if t.task_type == "verification"]
         result.design_tasks = [t for t in all_tasks if t.task_type in ("design", "challenge")]
@@ -397,4 +459,110 @@ class ContentParsingAgent:
         )
         result.raw_experiments = experiments   # 阶段一全量数据（含 section_text），供下游全量参考
         
+        # 5. 保存结果到缓存
+        if self.cache:
+            self.cache.save_parsing_result(result)
+            
         return result
+
+    async def _refine_tasks_iteratively(self, initial_tasks: List[TaskRecord]) -> List[TaskRecord]:
+        """
+        阶段三：迭代精细化拆解。
+        对验证性任务进行递归检查与拆分，严格限制在 3 轮内。
+        """
+        p3_check_path = Path("prompts/parsing/phase3_check.txt")
+        p3_split_path = Path("prompts/parsing/phase3_split.txt")
+        if not p3_check_path.exists() or not p3_split_path.exists():
+            return initial_tasks
+            
+        check_prompt = p3_check_path.read_text(encoding="utf-8")
+        split_prompt = p3_split_path.read_text(encoding="utf-8")
+        model_pro = self.config.gemini.model_pro
+        
+        from collections import deque
+        # (TaskRecord, current_round)
+        queue = deque([(t, 0) for t in initial_tasks])
+        final_tasks = []
+
+        print(f" (阶段三) 启动迭代任务精细化 (Max 3 rounds)...")
+        
+        while queue:
+            task, rounds = queue.popleft()
+            
+            # 仅对验证任务进行拆分
+            if task.task_type != "verification" or rounds >= 3:
+                final_tasks.append(task)
+                continue
+            
+            # 1. 检查是否需要拆分 (Flash)
+            can_split = await self.extractor.phase3_check_subdivision(task.analysis_raw, check_prompt)
+            
+            if can_split:
+                print(f"      [Round {rounds+1}] 发现可拆分任务: {task.task_name}")
+                # 2. 执行拆分 (Pro)
+                sub_data_list = await self.extractor.phase3_split_task(
+                    task.analysis_raw, 
+                    task.section_text, 
+                    split_prompt, 
+                    model_pro
+                )
+                
+                if sub_data_list:
+                    print(f"      → 成功拆分为 {len(sub_data_list)} 条更细原子任务")
+                    for sub in sub_data_list:
+                        new_task = task.model_copy()
+                        new_task.task_name = sub.get("task_name", task.task_name)
+                        new_task.analysis_raw = sub.get("description", "")
+                        # 核心元数据继承自父任务
+                        queue.append((new_task, rounds + 1))
+                else:
+                    # 拆分失败，保留原样
+                    final_tasks.append(task)
+            else:
+                # 无需拆分
+                final_tasks.append(task)
+                
+        print(f"   → 最终生成 {len(final_tasks)} 条精细化任务")
+        return final_tasks
+
+    async def _confirm_cache_with_llm(self, input_dir: Path, cached_result: ParsingResult) -> bool:
+        """调用 LLM 判断当前输入是否与缓存的任务语义一致。"""
+        # 提取当前输入文件的基本信息（文件名列表）
+        input_files = [f.name for f in input_dir.glob("*") if f.is_file()]
+        
+        # 提取缓存中的任务信息
+        cached_tasks = []
+        for t in cached_result.verification_tasks + cached_result.design_tasks:
+            cached_tasks.append({
+                "task_name": t.task_name,
+                "type": t.task_type,
+                "objective": t.experiment_objective[:200]
+            })
+            
+        prompt = f"""
+请判断当前的实验输入文件是否与之前的缓存任务列表一致。
+如果大体一致（实验内容、目标、任务名称匹配），请返回使用缓存。
+
+【当前输入文件列表】:
+{input_files}
+
+【历史缓存任务概览】:
+{cached_tasks}
+
+请以 JSON 格式回复：
+{{"use_cache": true, "reason": "解释原因"}} 或者 {{"use_cache": false, "reason": "解释原因"}}
+"""
+        try:
+            import json
+            label = "[Cache 确认]"
+            json_str = await self.extractor._call_with_json_retry(prompt, label)
+            
+            if not json_str:
+                print(f"{label} LLM 未能返回合法 JSON，默认不使用缓存。")
+                return False
+                
+            res_data = json.loads(json_str)
+            return res_data.get("use_cache", False)
+        except Exception as e:
+            print(f"{label} 确认失败: {e}")
+            return False

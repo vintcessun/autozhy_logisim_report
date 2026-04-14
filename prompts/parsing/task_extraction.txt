@@ -23,20 +23,21 @@
 [{"task_name": "验证8位串行加法器四种情况", "task_type": "verification"}]
 ```
 
-**✅ 正确解析（必须）：**
+**✅ 正确解析（必须，且使用具体十进制数）：**
 ```json
 [
-  {"task_name": "验证8位串行加法器：正数+正数=正数（不溢出）", "task_type": "verification", "description": "设置X为正数、Y为正数，Cin=0，预期结果为正数且OF=0"},
-  {"task_name": "验证8位串行加法器：正数+正数=负数（溢出）", "task_type": "verification", "description": "设置X为正数、Y为正数，Cin=0，预期结果产生溢出OF=1"},
-  {"task_name": "验证8位串行加法器：负数+负数=负数（不溢出）", "task_type": "verification", "description": "设置X为负数、Y为负数，预期结果为负数且OF=0"},
-  {"task_name": "验证8位串行加法器：负数+负数=正数（溢出）", "task_type": "verification", "description": "设置X为负数、Y为负数，预期结果产生溢出OF=1"}
+  {"task_name": "验证8位串行加法器：正数+正数=正数（不溢出）", "task_type": "verification", "description": "设置X为18，Y为35，Cin为0，预期结果为53且OF为0"},
+  {"task_name": "验证8位串行加法器：正数+正数=负数（溢出）", "task_type": "verification", "description": "设置X为120，Y为10，Cin为0，预期结果产生溢出OF为1"},
+  {"task_name": "验证8位串行加法器：负数+负数=负数（不溢出）", "task_type": "verification", "description": "设置X为-20，Y为-10，预期结果为-30且OF为0"},
+  {"task_name": "验证8位串行加法器：负数+负数=正数（溢出）", "task_type": "verification", "description": "设置X为-120，Y为-10，预期结果产生溢出OF为1"}
 ]
 ```
 
 ---
-### 规则三：具体数值必须保留
+### 规则三：具体数值必须保留与具体化
 
-如果原文给出了具体的输入输出值（如 X=FFFFFFF0, Y=00100, 结果=FFFFFF00），则 `task_name` 中必须含该具体值，`description` 必须完整复述输入与预期输出。
+1. 如果原文给出了具体的输入输出值（如 X=FFFFFFF0, Y=00100），则 `task_name` 中必须含该具体值，`description` 必须完整复述输入与预期输出。
+2. **模糊数据处理**：如果原文仅给出概念（如“正数”），必须指定一个具体的、非零、非边界的**十进制**数值。除非提到 0 或 最大值，否则不要使用极端值。
 
 ---
 ### 上下文信息：
