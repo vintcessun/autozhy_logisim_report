@@ -32,9 +32,9 @@
    - 作用: 读取当前值。
 
 3. `tick_until`
-   - 格式: {{ "action": "tick_until", "target": "观测点", "expected": "期望值", "max": 100, "clock": "可选输入时钟引脚" }}
+   - 格式: {{ "action": "tick_until", "target": "观测点", "expected": "期望值", "max": 100000, "clock": "可选输入时钟引脚" }}
    - 规则:
-     - `max` 至少为 100。
+     - `max` 至少为 100000。取得尽可能大如果遇到未达到的错误
      - `clock` 若提供，必须是输入引脚；API 会每周期自动脉冲该引脚。
 
 4. `check_value`
@@ -97,7 +97,7 @@
   {{ "action": "set_value", "target": "复位", "value": "1" }},
   {{ "action": "set_value", "target": "复位", "value": "0" }},
   {{ "action": "run_until_stable_then_tick", "target": "访问次数", "timeout_second": 10, "k": 100, "stable_samples": 5, "poll_ms": 20 }},
-  {{ "action": "tick_until", "target": "END", "expected": "1", "max": 100, "clock": "时钟" }},
+  {{ "action": "tick_until", "target": "END", "expected": "1", "max": 100000, "clock": "时钟" }},
   {{ "action": "check_value", "target": "访问次数", "expected": "100" }},
   {{ "action": "get_value", "target": "访问次数" }}
 ]
