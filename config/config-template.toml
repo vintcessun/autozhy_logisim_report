@@ -8,5 +8,9 @@ api_key = "YOUR_API_KEY_HERE"
 base_url = "YOUR_BASE_URL_HERE"
 
 # 模型选型
-model_pro = "gemini-3-flash" # 测试使用的是flash作为决策模型
+model_pro = "gemini-3-flash"          # 测试使用的是flash作为决策模型
 model_flash = "gemini-3.1-flash-lite" # 使用flash-lite作为进行具体实践的模型
+
+[headless]
+# Logisim Headless WebSocket 端口
+port = 9924
