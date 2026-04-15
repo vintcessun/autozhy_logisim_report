@@ -1,14 +1,14 @@
 import asyncio
 from pathlib import Path
-from google.genai import types
-from ..utils.ai_utils import retry_llm_call
-from ..utils.tool_definitions import tools_list
+from ..utils.ai_utils import generate_content_with_tools
+
 
 class StrategyAgent:
     """
     Pro 模型：负责 16 位 CLA 的架构设计与分解。
     具有全量工具权限。
     """
+
     def __init__(self, client, model_id: str):
         self.client = client
         self.model_id = model_id
@@ -17,8 +17,12 @@ class StrategyAgent:
         """
         调研并输出详细的设计规格。
         """
-        info_text = info_path.read_text(encoding="utf-8") if info_path.exists() else "无任务描述"
-        
+        info_text = (
+            info_path.read_text(encoding="utf-8")
+            if info_path.exists()
+            else "无任务描述"
+        )
+
         prompt = f"""你是一个高级数字电路设计师（Pro 级别）。
 任务：设计一个 16 位先行进位加法器 (CLA)。
 要求：组内并行、组间并行设计。
@@ -42,19 +46,11 @@ class StrategyAgent:
 - 对应的逻辑表达式
 - 各组件的命名规范建议
 """
-        
-        # 启用 Tool Calling 自动处理
-        config = types.GenerateContentConfig(
-            tools=tools_list,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False)
-        )
-        
-        # 使用统一的重试机制
-        response = await retry_llm_call(
-            self.client.models.generate_content,
+
+        response = await generate_content_with_tools(
+            self.client,
             model=self.model_id,
             contents=prompt,
-            config=config
         )
-        
+
         return response.text.strip()
