@@ -112,6 +112,9 @@ class VerificationAgent:
         if not self.emulator:
             self.emulator = LogisimEmulator(self.config, self.client)
 
+        print(
+            f"[Verification] 任务: {task.task_name}，目标子电路: {task.target_subcircuit}"
+        )
         print(f"[Verification] 正在连接并加载电路: {circ_path}")
         success = await self.emulator.launch_and_initialize(str(circ_path))
         if not success:
@@ -131,6 +134,7 @@ class VerificationAgent:
         failed_item = None
         retry_feedback_history = []
         prev_circuit_screenshot: bytes | None = None  # 上一轮失败时的电路截图（内存中）
+        prev_selected_circuit: str | None = None  # 上一轮选择的子电路名称
 
         for attempt in range(max_retries + 1):
             if attempt > 0:
@@ -148,20 +152,32 @@ class VerificationAgent:
             )
 
             # 2. 识别并切换到目标子电路；每次均由 LLM 决定，重试时附带上轮电路截图辅助判断
-            await self._identify_and_switch_circuit(
+            selected_circuit = await self._identify_and_switch_circuit(
                 task, circuit_list, screenshot_bytes=prev_circuit_screenshot
             )
 
             io_resp = await self.emulator.send_command("get_io")
             io_info = io_resp.get("payload", {}) if isinstance(io_resp, dict) else {}
-            snap = await self.emulator.send_command(
-                "get_screenshot", width=1280, height=720
+            reuse_prev_end_screenshot = (
+                attempt > 0
+                and prev_circuit_screenshot is not None
+                and selected_circuit is not None
+                and selected_circuit == prev_selected_circuit
             )
-            screenshot = (
-                snap["binary"]
-                if isinstance(snap, dict) and snap.get("status") == "ok"
-                else None
-            )
+            if reuse_prev_end_screenshot:
+                screenshot = prev_circuit_screenshot
+                print("[Verification] 本轮电路未变化，复用上一轮结束截图。")
+            else:
+                snap = await self.emulator.send_command(
+                    "get_screenshot", width=1280, height=720
+                )
+                screenshot = (
+                    snap["binary"]
+                    if isinstance(snap, dict) and snap.get("status") == "ok"
+                    else None
+                )
+
+            prev_selected_circuit = selected_circuit
 
             # 3. 使用 blueprint 生成指令；失败后带反馈进入下一轮重生成
             retry_feedback = (
@@ -191,8 +207,10 @@ class VerificationAgent:
                 if isinstance(resp, dict) and resp.get("status") == "error":
                     failed_item = item
                     last_error = resp.get("message")
-                    last_error_step = item.get("step")
-                    print(f"[API Error] 指令执行失败: {last_error}")
+                    last_error_step = f"API: {action} with args {kwargs}"
+                    print(
+                        f"[API Error] 指令执行失败: {last_error} (步骤: {last_error_step})"
+                    )
                     break
 
             if not failed_item:
@@ -224,7 +242,9 @@ class VerificationAgent:
             task.analysis_raw = (
                 f"API 指令序列执行失败，已达重试上限。错误: {last_error}"
             )
-            return task
+            raise RuntimeError(
+                f"Verification failed after {max_retries} attempts. Last error: {last_error}"
+            )
 
         # 5. 最终抓图与验证
         print("[Verification] 正在保存最终状态截图...")
