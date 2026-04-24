@@ -48,9 +48,7 @@ class CacheManager:
     # ------------------------------------------------------------------ #
     def save_parsing_result(self, result: ParsingResult):
         """序列化并保存 ParsingResult。"""
-        self.parsing_file.write_text(
-            result.model_dump_json(indent=2), encoding="utf-8"
-        )
+        self.parsing_file.write_text(result.model_dump_json(indent=2), encoding="utf-8")
         print(f"[Cache] 解析结果已保存: {self.parsing_file}")
 
     def load_parsing_result(self) -> Optional[ParsingResult]:
@@ -112,10 +110,8 @@ class CacheManager:
         """保存某设计任务拆解出的子任务映射。"""
         existing = {}
         if self.design_subs_file.exists():
-            try:
-                existing = json.loads(self.design_subs_file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            # 已有文件损坏时直接抛错——静默覆盖会丢掉其它父任务的记录。
+            existing = json.loads(self.design_subs_file.read_text(encoding="utf-8"))
         existing[parent_id] = [t.model_dump() for t in sub_tasks]
         self.design_subs_file.write_text(
             json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -138,3 +134,68 @@ class CacheManager:
         except Exception as e:
             print(f"[Cache] 子任务缓存 {parent_id} 损坏: {e}")
             return None
+
+    # ------------------------------------------------------------------ #
+    # Cache alignment utilities
+    # ------------------------------------------------------------------ #
+    def invalidate_parsing(self):
+        """删除解析结果缓存，强制下次重新执行 ParsingAgent。"""
+        if self.parsing_file.exists():
+            self.parsing_file.unlink()
+            print("[Cache] 解析缓存已失效，将重新运行 ParsingAgent。")
+
+    def align_tasks(self, result: ParsingResult):
+        """
+        对齐任务缓存：删除不再属于当前解析结果的孤立任务缓存文件，
+        同时移除 design_subtasks.json 中不匹配的父任务条目。
+        """
+        if not self.tasks_dir.exists():
+            return
+
+        # 收集所有有效的 task_id（含顶层任务）
+        valid_ids: set[str] = set()
+        for task in result.verification_tasks:
+            valid_ids.add(str(task.task_id))
+        for task in result.design_tasks:
+            valid_ids.add(str(task.task_id))
+
+        # 补充 design_subtasks 中记录的子任务 id
+        if self.design_subs_file.exists():
+            try:
+                subs_data: dict[str, list[dict]] = json.loads(
+                    self.design_subs_file.read_text(encoding="utf-8")
+                )
+                # 移除不属于当前结果的父任务条目
+                stale_parents: list[str] = [
+                    pid for pid in subs_data.keys() if pid not in valid_ids
+                ]
+                for pid in stale_parents:
+                    del subs_data[pid]
+                if stale_parents:
+                    self.design_subs_file.write_text(
+                        json.dumps(subs_data, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    print(f"[Cache] 移除孤立父任务条目: {stale_parents}")
+
+                # 将保留的子任务 id 加入有效集合
+                for sub_list in subs_data.values():
+                    for item in sub_list:
+                        if isinstance(item, dict) and "task_id" in item:
+                            valid_ids.add(str(item["task_id"]))
+            except Exception as e:
+                print(f"[Cache] align_tasks 处理 design_subtasks 失败: {e}")
+
+        # 删除孤立的任务缓存文件
+        removed: list[str] = []
+        for p in self.tasks_dir.glob("*.json"):
+            task_id = p.stem
+            if task_id not in valid_ids:
+                p.unlink()
+                removed.append(task_id)
+        if removed:
+            preview = removed[:5]
+            suffix = "..." if len(removed) > 5 else ""
+            print(f"[Cache] 移除孤立任务缓存 ({len(removed)} 条): {preview}{suffix}")
+        else:
+            print("[Cache] 任务缓存已对齐，无孤立条目。")

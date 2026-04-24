@@ -508,6 +508,11 @@ def tool_write_and_run_python(
         f"    [Tool] Running tool_write_and_run_python at {script_path} (cwd={cwd})"
     )
 
+    child_env = {
+        **os.environ,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    }
     try:
         completed = subprocess.run(
             [sys.executable, str(script_path)],
@@ -517,6 +522,7 @@ def tool_write_and_run_python(
             encoding="utf-8",
             errors="replace",
             timeout=max(1, int(timeout_seconds)),
+            env=child_env,
         )
         return json.dumps(
             {
@@ -565,8 +571,10 @@ def search_web(query: str) -> str:
         data = response.json()
         results = data.get("results", [])[:5]
         return "\n".join([f"- {r.get('title')}: {r.get('content')}" for r in results])
-    except:
-        return "搜索失败。"
+    except Exception as e:
+        # 工具约定：永不抛异常，否则会把单步错误升格为整轮失败。
+        # 但必须回传具体错误细节，不能用"搜索失败。"这种无信息字符串糊弄模型。
+        return f"搜索失败: {type(e).__name__}: {e} (SEARXNG_URL={base_url})"
 
 
 # 导出的工具函数列表，供智能体使用

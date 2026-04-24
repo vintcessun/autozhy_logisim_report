@@ -2,10 +2,10 @@ import asyncio
 import ctypes
 import shutil
 from pathlib import Path
-from google import genai
 
 from src.utils.config_loader import ConfigManager
 from src.utils.cache_manager import CacheManager
+from src.utils.llm_client import create_genai_client
 from src.agents.content_parsing import ContentParsingAgent
 from src.agents.design_agent import DesignAgent
 from src.agents.verification_agent import VerificationAgent
@@ -93,15 +93,12 @@ async def main():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. 配置现代 SDK 客户端
-    endpoint = app_config.gemini.base_url.rstrip("/")
-    if endpoint.endswith("/v1beta"):
-        endpoint = endpoint[:-7]
-    elif endpoint.endswith("/v1"):
-        endpoint = endpoint[:-3]
-
-    client = genai.Client(
-        api_key=app_config.gemini.api_key, http_options={"base_url": endpoint}
+    # 2. 配置 Google 原生 Gemini 客户端
+    #    改用原生 API 以避免 OpenAI 兼容层转发 tool_call 时丢失 thought_signature
+    #    导致的 400 报错。
+    client = create_genai_client(
+        api_key=app_config.gemini.api_key,
+        base_url=app_config.gemini.base_url,
     )
 
     # 3. 初始化智能体
@@ -124,6 +121,22 @@ async def main():
     # --- [1] 内容解析 ---
     print("--- [1] 启动内容解析 ---")
     parsing_result = await parsing_agent.run(input_dir)
+
+    # 若工作区仍为空（缓存命中但文件未释放），强制重新解析
+    workspace_files = (
+        [p for p in workspace_dir.iterdir() if not p.name.startswith(".")]
+        if workspace_dir.exists()
+        else []
+    )
+    if not workspace_files:
+        print(
+            "[Main] 工作区为空（缓存命中但文件未释放），清除解析缓存并重新运行 ParsingAgent..."
+        )
+        cache.invalidate_parsing()
+        parsing_result = await parsing_agent.run(input_dir)
+        # 对齐缓存：移除与新解析结果不匹配的孤立任务缓存
+        cache.align_tasks(parsing_result)
+
     print(
         f"解析到 {len(parsing_result.verification_tasks)} 条验证任务，{len(parsing_result.design_tasks)} 条设计任务。"
     )
@@ -182,4 +195,12 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    initialize_system()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[Main] 用户中断，当前任务已终止。")
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"\n[Main] 执行失败: {type(exc).__name__}: {exc}")
+        raise

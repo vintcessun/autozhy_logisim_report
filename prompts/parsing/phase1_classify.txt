@@ -11,11 +11,33 @@
 对每一个子实验项，输出对应的 JSON 对象，包含：
 - `name`: 实验子项名称（精确，如 "4位先行进位电路"、"16位快速加法器（组内并行、组间串行）"）。
 - `task_type`: 只能是 "design"（设计实验）/ "verification"（验证实验）/ "challenge"（挑战性实验）。
+  **硬规则**：`task_type` 完全由大纲章节号决定，不得按正文内容猜测：
+  - 3.1 节下的所有实验 → `verification`
+  - 3.2 节下的所有实验 → `design`
+  - 3.3 节下的所有实验 → `challenge`
+  下方大纲中每个 section 标题已标注 `[task_type=...]`，请直接取用。
 - `target_subcircuit`: 对应子电路名称。
 - `description`: 1-2句对该实验的整体说明。
 - `section_text`: **关键**：从原文中**完整复制**该子项对应的所有描述文字，包括所有的输入输出参数、①②③验证步骤、具体数值（如 X=FFFFFFF0）。不得截断或摘要，必须原样复制。
 - `matched_source_circ`: 对应的起步电路文件名（从下方列表中选取最匹配的），或 null。
-- `matched_reference_circ`: 对应的参考电路文件名（仅 design/challenge 任务，从下方列表中），或 null。
+  **选择准则**（必须按 task_type 区分候选池，禁止跨池选择）：
+  1. `task_type=verification` → 只能从【教师起步电路清单】（TEA_ 前缀）中选择，且文件名后缀必须为"验证实验"。
+  2. `task_type=design` → 只能从【参考成品电路清单】（REF_ 前缀）中选择，且文件名后缀必须为"设计实验"。
+  3. `task_type=challenge` → 只能从【参考成品电路清单】（REF_ 前缀）中选择，且文件名后缀必须为"挑战实验"（若无专用挑战文件则选主题一致的 REF 成品电路）。
+  4. 候选池中若没有同时满足"主题匹配 + task_type 后缀对齐"的文件，必须输出 `null`，**不得**降格选择后缀或前缀不符的文件。
+  5. 典型反例：
+     - 3.1 节 cache 相关验证实验（直接相联、全相联、组相联映射）的 `matched_source_circ` 必须是 `TEA_cache 验证实验.circ`，严禁匹配到 `TEA_cache 设计实验.circ`（该文件是 3.3 挑战实验专用）。
+     - 3.2/3.3 节的 design/challenge 实验严禁选择 `TEA_xxx.circ` 作为 source，必须选择对应的 `REF_xxx.circ` 成品电路。
+- `matched_reference_circ`: 对应的参考成品电路文件名（仅 design/challenge 任务从【参考成品电路清单】中选取，通常与 `matched_source_circ` 相同；verification 任务必须为 null）。
+
+---
+### 强制覆盖约束：
+
+以下是从实验指导书 DOCX 解析出的结构化大纲。你**必须**为其中每一个 `[N.M]` 实验组生成对应的 JSON 条目，不得遗漏。每个 `[N.M]` 条目必须在 `experiments` 列表中有且仅有对应的一条（或若干原子拆分条目，但合起来必须覆盖该组）。
+
+```
+{{outline}}
+```
 
 ---
 ### 上下文信息：

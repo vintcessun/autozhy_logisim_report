@@ -51,7 +51,44 @@ class DesignAgent:
             cached_main = self.cache.get_task_if_done(task)
             cached_subs = self.cache.load_design_subtasks(task.task_id)
             if cached_main and cached_subs is not None:
-                return cached_main, cached_subs
+                run_circ = reference_circ_path or source_circ_path
+                if run_circ and self.verification_agent:
+                    print(
+                        f"[DesignAgent] 命中缓存，正在逐个复核 {len(cached_subs)} 个子任务..."
+                    )
+                    revalidated: list[TaskRecord] = []
+                    all_ok = True
+                    for sub in cached_subs:
+                        try:
+                            # VerificationAgent.run 会对缓存做目标校验，
+                            # 未通过则自动清缓存并重跑。
+                            sub = await self.verification_agent.run(sub, run_circ)
+                        except Exception as e:
+                            all_ok = False
+                            sub.status = "failed"
+                            sub.analysis_raw = f"缓存复核异常: {e}"
+                            print(
+                                f"[DesignAgent] 缓存子任务复核失败: {sub.task_name} -> {e}"
+                            )
+                        if sub.status != "finished":
+                            all_ok = False
+                        revalidated.append(sub)
+                    if all_ok:
+                        print("[DesignAgent] 所有子任务缓存已通过复核。")
+                        return cached_main, revalidated
+                    print(
+                        "[DesignAgent] 存在未通过复核的子任务，将失效主任务缓存并重跑设计任务。"
+                    )
+                    try:
+                        main_cache = self.cache._task_path(task.task_id)
+                        if main_cache.exists():
+                            main_cache.unlink()
+                    except Exception as e:
+                        print(f"[DesignAgent] 失效主任务缓存失败（忽略）: {e}")
+                    # 继续下面的正常流程重新拆解与验证
+                else:
+                    # 无电路或未注入 verification_agent：保守保留旧行为
+                    return cached_main, cached_subs
 
         # 1. 参考电路截图
         if reference_circ_path and reference_circ_path.exists():
@@ -195,36 +232,22 @@ class DesignAgent:
             print(f"[DesignAgent] 警告: 执行电路切换失败: {e}")
 
     def _extract_json(self, text: str) -> str:
-        """从模型输出中提取 JSON 对象或数组。"""
+        """仅剥离 ```json ... ``` / ``` ... ``` 围栏，剩下的交给调用方 json.loads。"""
         text = (text or "").strip()
         if not text:
             return ""
-
-        try:
-            json.loads(text)
-            return text
-        except Exception:
-            pass
-
-        for pattern in (r"```json\s*(.*?)\s*```", r"(\{.*\})", r"(\[.*\])"):
-            m = re.search(pattern, text, re.DOTALL)
-            if not m:
-                continue
-            candidate = m.group(1).strip()
-            try:
-                json.loads(candidate)
-                return candidate
-            except Exception:
-                continue
-
-        return ""
+        m = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", text, re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+        return text
 
     async def _decompose_to_subtasks(self, task: TaskRecord) -> list[TaskRecord]:
         """调用 LLM 进行细粒度验证任务拆解"""
         prompt_path = self.prompt_dir / "design" / "decompose.txt"
         if not prompt_path.exists():
-            print(f"[DesignAgent] 错误: 找不到 Prompt 文件 {prompt_path}")
-            return []
+            raise FileNotFoundError(
+                f"[DesignAgent] 找不到必需的 Prompt 文件: {prompt_path}"
+            )
 
         prompt_tmpl = prompt_path.read_text(encoding="utf-8")
         prompt = (
@@ -244,47 +267,30 @@ class DesignAgent:
         )
 
         raw_content = response.text.strip()
-
-        # 提取 JSON 内容
-        json_str = ""
-        md_match = re.search(r"```json\s*(.*?)\s*```", raw_content, re.DOTALL)
-        if md_match:
-            json_str = md_match.group(1).strip()
-        else:
-            bracket_match = re.search(r"(\[.*\])", raw_content, re.DOTALL)
-            if bracket_match:
-                json_str = bracket_match.group(1).strip()
-            else:
-                json_str = raw_content
-
-        if not json_str:
-            print(
-                f"[DesignAgent] 警告: LLM 返回内容无法识别为 JSON 列表: {raw_content[:200]}"
+        json_str = self._extract_json(raw_content)
+        items = json.loads(json_str)
+        if not isinstance(items, list):
+            raise RuntimeError(
+                f"[DesignAgent] 拆解返回非 list 结构（{type(items).__name__}）：{raw_content[:200]}"
             )
-            return []
 
-        try:
-            items = json.loads(json_str)
-            sub_tasks = []
-            for item in items:
-                sub_task = TaskRecord(
-                    task_name=item.get("task_name", f"{task.task_name} - 子任务"),
-                    task_type="verification",
-                    # 继承父任务的电路（即归档后的命名电路）
-                    source_circ=task.source_circ,
-                    analysis_raw=item.get("description", ""),
-                    # 继承原始 info 文字
-                    section_text=task.section_text,
-                    target_subcircuit=task.target_subcircuit,
-                    experiment_objective=task.experiment_objective,
-                    problem_answers=task.problem_answers.copy(),
-                )
-                sub_tasks.append(sub_task)
-            print(f"[DesignAgent] 成功拆解出 {len(sub_tasks)} 个验证子任务。")
-            return sub_tasks
-        except Exception as e:
-            print(f"[DesignAgent] 错误: JSON 解析失败: {e}\n原文: {json_str[:200]}")
-            return []
+        sub_tasks = []
+        for item in items:
+            sub_task = TaskRecord(
+                task_name=item.get("task_name", f"{task.task_name} - 子任务"),
+                task_type="verification",
+                # 继承父任务的电路（即归档后的命名电路）
+                source_circ=task.source_circ,
+                analysis_raw=item.get("description", ""),
+                # 继承原始 info 文字
+                section_text=task.section_text,
+                target_subcircuit=task.target_subcircuit,
+                experiment_objective=task.experiment_objective,
+                problem_answers=task.problem_answers.copy(),
+            )
+            sub_tasks.append(sub_task)
+        print(f"[DesignAgent] 成功拆解出 {len(sub_tasks)} 个验证子任务。")
+        return sub_tasks
 
     async def _run_verification_subtasks(
         self,
