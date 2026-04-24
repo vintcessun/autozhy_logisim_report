@@ -24,3 +24,4 @@ wheels/
 
 # Test Files
 /.pytest_cache
+/run_backend.bat
